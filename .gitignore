@@ -1,0 +1,27 @@
+# Credentials & local secrets (NEVER commit real keys, tokens, or bucket names)
+resources/gcs-key.json
+resources/gcs-bucket
+resources/hf-token
+gcs-key.json
+gcs-bucket
+hf-token
+*.key
+*.pem
+*secret*
+*credential*
+.env
+.env.*
+
+# Explicitly keep sanitized example templates & the offline audit script
+!resources/*.example
+!scripts/audit_secrets.py
+
+# OS / editor / temporary build junk
+.DS_Store
+__MACOSX/
+._*
+__pycache__/
+*.pyc
+*.pyo
+*.tmp
+*.swp

@@ -1,0 +1,76 @@
+{
+ "exe": "/content/project-maya/build/maya-ds4",
+ "args": [
+  "--pack",
+  "/content/maya-models/DeepSeek-V4.1-Flash-1017-abliterated-GGUF/Mix-256G/maya-ds4",
+  "--max-context",
+  "262144",
+  "--tp",
+  "1",
+  "--threads",
+  "on",
+  "--dspark",
+  "on",
+  "--vision",
+  "on",
+  "--reserve-mib",
+  "700",
+  "--mmap-experts",
+  "off",
+  "--prefill-chunk",
+  "32768",
+  "--verbose",
+  "--serve",
+  "--no-expert-cache"
+ ],
+ "cwd": "/content/project-maya",
+ "tokenizer": "/content/maya-models/DeepSeek-V4.1-Flash-1017-abliterated-GGUF/Mix-256G/maya-ds4/tokenizer",
+ "model_name": "deepseek-v4.1-flash-abliterated",
+ "gpu": [
+  0
+ ],
+ "sampling": {
+  "temperature": 0.6,
+  "top_p": 0.95,
+  "min_p": 0.05
+ },
+ "reasoning_effort": "high",
+ "lib_dirs": [
+  "/usr/local/cuda-13.0/lib64",
+  "/usr/local/cuda-13.0/targets/x86_64-linux/lib"
+ ],
+ "port": 8000,
+ "log": "/content/project-maya/maya-ds4.log",
+ "installer": {
+  "family": "deepseek",
+  "models_dir": "/content/maya-models",
+  "quant": "DeepSeek-V4.1-Flash-1017",
+  "ds4_quant": "abliterated-256g",
+  "model_dir": "/content/maya-models/DeepSeek-V4.1-Flash-1017-abliterated-GGUF/Mix-256G",
+  "written": "2026-11-11 07:25",
+  "speed_calibration": {
+   "date": "2026-11-11 07:25",
+   "version": "1.1.56",
+   "dspark_tok_s": 50.0,
+   "no_drafting_tok_s": 35.0,
+   "kept": "dspark"
+  },
+  "thinking_budget_set": true
+ },
+ "env": {
+  "DS4_ENGRAM_CACHE_MB": "4096",
+  "DS4_LENT_RAM_GB": "7.5",
+  "DS4_FLOW_COPY_DMA": "1",
+  "DS4_STAT_LOG": "1",
+  "DS4_RAM_MARGIN_GB": "6.0",
+  "DS4_ENGRAM_THREADS": "768",
+  "DS4_YOCO_CONE": "1",
+  "MAYA_DS4_EG_RANDOM": "1",
+  "MAYA_DS4_RESTORE_TAIL": "0",
+  "MAYA_S2_LOCAL_MAX": "16",
+  "MAYA_S2_GCS_THRESH": "160",
+  "DS4_INDEX_TC": "1",
+  "DS4_CPU_PREPARE_ROWS": "1"
+ },
+ "thinking_budget": 16384
+}
