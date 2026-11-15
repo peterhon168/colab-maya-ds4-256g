@@ -1,0 +1,780 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Maya · Strata Studio</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%230B0F17'/%3E%3Crect x='2.5' y='2.5' width='19' height='19' rx='5.5' fill='none' stroke='%233B82F6' stroke-width='1.8'/%3E%3Cpath d='M7.5 15.5V8.5L12 13L16.5 8.5V15.5' fill='none' stroke='%2310B981' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div id="appShell" class="app-shell">
+    <!-- Top Global Bar -->
+    <header id="topbar" class="topbar">
+      <div class="topbar-left">
+        <div class="brand">
+          <span class="brand-logo" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none">
+              <defs>
+                <linearGradient id="brandGrad" x1="2" y1="2" x2="22" y2="22" gradientUnits="userSpaceOnUse">
+                  <stop offset="0%" stop-color="#3B82F6"/>
+                  <stop offset="100%" stop-color="#10B981"/>
+                </linearGradient>
+              </defs>
+              <rect x="2.5" y="2.5" width="19" height="19" rx="5.5" stroke="url(#brandGrad)" stroke-width="1.8"/>
+              <path d="M7.5 15.5V8.5L12 13L16.5 8.5V15.5" stroke="#F1F5F9" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </span>
+          <span class="brand-title">Maya · Strata Studio</span>
+        </div>
+
+        <div id="topStatusPill" class="status-pill status-pill--offline" title="推理引擎连接状态">
+          <span class="status-dot"></span>
+          <span id="topStatusText" class="status-text" data-i18n="status.standby">待机未连接</span>
+        </div>
+
+        <span id="topEngineBadge" class="engine-badge">Project Maya (ds4)</span>
+        <span id="topGpuBadge" class="gpu-chip hidden tabular-nums"></span>
+      </div>
+
+      <div class="topbar-right">
+        <button id="btnOpenGuide" class="top-btn" type="button">
+          <svg viewBox="0 0 20 20" width="14" height="14" fill="none" aria-hidden="true">
+            <path d="M4.5 4.5A1.5 1.5 0 0 1 6 3h8a1.5 1.5 0 0 1 1.5 1.5v11a1.5 1.5 0 0 1-1.5 1.5H6a1.5 1.5 0 0 1-1.5-1.5v-11Z" stroke="currentColor" stroke-width="1.5"/>
+            <path d="M7.5 7h5M7.5 10h5M7.5 13h3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+          <span data-i18n="top.guide">示例接入指南</span>
+        </button>
+
+        <button id="btnOpenExternalWebui" class="top-btn" type="button">
+          <svg viewBox="0 0 20 20" width="14" height="14" fill="none" aria-hidden="true">
+            <path d="M11 4h5v5M16 4l-7 7M8 5H5.5A1.5 1.5 0 0 0 4 6.5v8A1.5 1.5 0 0 0 5.5 16h8a1.5 1.5 0 0 0 1.5-1.5V12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <span data-i18n="top.openExternal">外部浏览器打开 WebUI</span>
+        </button>
+
+        <button id="btnLangToggle" class="top-btn top-btn--compact tabular-nums" type="button" title="切换中/英文">
+          <span id="langLabel">中 / EN</span>
+        </button>
+
+        <button id="btnPrivacyMask" class="privacy-toggle is-active" type="button" aria-pressed="true" title="录屏隐私打码">
+          <span class="privacy-eye" aria-hidden="true">👁️</span>
+          <span data-i18n="top.privacyMask">录屏隐私打码</span>
+          <span id="privacyMaskState" class="privacy-state">ON</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Main 3-Column Workspace -->
+    <main class="workspace-grid">
+      <!-- LEFT COLUMN: Compute Instance & Engine Mode -->
+      <aside class="col-left">
+        <!-- Card 1: Colab Compute & Quota -->
+        <section class="panel-card" aria-labelledby="colabCardTitle">
+          <div class="card-header">
+            <div class="card-title-group">
+              <span class="card-icon card-icon--blue" aria-hidden="true">
+                <svg viewBox="0 0 20 20" width="15" height="15" fill="none">
+                  <rect x="3" y="4" width="14" height="5" rx="1.5" stroke="currentColor" stroke-width="1.5"/>
+                  <rect x="3" y="11" width="14" height="5" rx="1.5" stroke="currentColor" stroke-width="1.5"/>
+                  <circle cx="6" cy="6.5" r="0.9" fill="currentColor"/>
+                  <circle cx="6" cy="13.5" r="0.9" fill="currentColor"/>
+                </svg>
+              </span>
+              <h2 id="colabCardTitle" class="card-title" data-i18n="colab.title">Colab 算力实例 &amp; 额度</h2>
+            </div>
+            <span id="colabStateBadge" class="mini-badge mini-badge--muted" data-i18n="colab.disconnected">未连接</span>
+          </div>
+
+          <!-- Google Account Row -->
+          <div class="account-row">
+            <div class="account-meta">
+              <span class="account-label" data-i18n="colab.googleAccount">Google 账号</span>
+              <span id="accountEmailText" class="account-email mono-ellipsis" title="">未登录 Google 账号</span>
+            </div>
+            <div class="account-actions">
+              <button id="btnColabRefresh" class="btn btn--ghost btn--xs" type="button" data-i18n="common.refresh">刷新</button>
+              <button id="btnOpenAuthModal" class="btn btn--ghost btn--xs" type="button" data-i18n="colab.switchAccount">换号 / 登录</button>
+            </div>
+          </div>
+
+          <!-- GPU Selector -->
+          <div class="field-group">
+            <div class="field-label-row">
+              <label for="gpuSelectGroup" class="field-label" data-i18n="colab.gpuLabel">算力机型</label>
+              <span id="gpuShapeHint" class="field-hint" data-i18n="colab.g4Hint">G4 不传 high-mem</span>
+            </div>
+            <div id="gpuSelectGroup" class="gpu-grid" role="radiogroup" aria-label="GPU 机型选择">
+              <button class="gpu-option is-selected" type="button" data-gpu="g4" aria-checked="true" role="radio">
+                <span class="gpu-option-top">
+                  <strong>G4 · RTX PRO 6000 · 96GB</strong>
+                  <span class="rec-tag" data-i18n="common.recommended">推荐</span>
+                </span>
+                <span class="gpu-option-sub" data-i18n="colab.g4Note">Standard 单规格 (176.9GB RAM) · 不传 high-mem</span>
+              </button>
+              <button class="gpu-option" type="button" data-gpu="a100" aria-checked="false" role="radio">
+                <span class="gpu-option-top">
+                  <strong>A100 · 80GB (High-RAM)</strong>
+                </span>
+                <span class="gpu-option-sub" data-i18n="colab.a100Note">双盘架构 · 自动启用 --high-mem</span>
+              </button>
+              <div class="gpu-row-compact">
+                <button class="gpu-option gpu-option--compact" type="button" data-gpu="l4" aria-checked="false" role="radio">
+                  <strong>L4 · 24GB</strong>
+                </button>
+                <button class="gpu-option gpu-option--compact" type="button" data-gpu="t4" aria-checked="false" role="radio">
+                  <strong>T4 · 16GB</strong>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Session Input -->
+          <div class="field-group">
+            <div class="field-label-row">
+              <label for="sessionInput" class="field-label" data-i18n="colab.sessionName">会话名称</label>
+              <div id="sessionChips" class="session-chips"></div>
+            </div>
+            <input id="sessionInput" class="text-input mono" type="text" value="easycolab" placeholder="easycolab" autocomplete="off" spellcheck="false">
+          </div>
+
+          <!-- Primary Action Buttons -->
+          <div class="colab-primary-actions">
+            <button id="btnDeployColab" class="btn btn--primary btn--block" type="button">
+              <span>⚡</span>
+              <span data-i18n="colab.deployBtn">唤醒实例并部署</span>
+            </button>
+            <button id="btnAttachColab" class="btn btn--secondary btn--block" type="button">
+              <span>🔗</span>
+              <span data-i18n="colab.attachBtn">无损纳管已运行会话</span>
+            </button>
+            <p class="helper-note" data-i18n="colab.attachNote">只读探测 GPU、进程与隧道 URL，绝不中断当前推理或保活任务。</p>
+          </div>
+
+          <!-- Quota & Keepalive 3-Column Grid -->
+          <div class="quota-grid">
+            <div class="quota-cell">
+              <span class="quota-label" data-i18n="colab.balance">账户余额 (CU)</span>
+              <strong id="cuBalanceValue" class="quota-value tabular-nums">--</strong>
+            </div>
+            <div class="quota-cell">
+              <span class="quota-label" data-i18n="colab.burnRate">扣费速率 (CU/h)</span>
+              <strong id="cuBurnRateValue" class="quota-value quota-value--amber tabular-nums">--</strong>
+            </div>
+            <div class="quota-cell">
+              <span class="quota-label" data-i18n="colab.keepalive">12m 保活</span>
+              <button id="btnKeepaliveToggle" class="switch-pill" type="button" role="switch" aria-checked="false">
+                <span class="switch-track"><span class="switch-thumb"></span></span>
+                <span id="keepaliveLabel" class="switch-text" data-i18n="common.off">未开启</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Hardware & Mount Summary -->
+          <div id="colabRuntimeStrip" class="runtime-strip hidden">
+            <div id="colabGpuDetected" class="runtime-gpu mono-ellipsis"></div>
+            <div id="colabMountPills" class="mount-pills"></div>
+          </div>
+
+          <!-- Danger Stop Button -->
+          <div class="card-footer-danger">
+            <button id="btnStopColab" class="btn btn--danger-outline btn--block" type="button">
+              <span>🛑</span>
+              <span data-i18n="colab.stopBtn">释放云端实例</span>
+            </button>
+          </div>
+        </section>
+
+        <!-- Card 2: Inference Engine & Acceleration Mode -->
+        <section class="panel-card" aria-labelledby="engineCardTitle">
+          <div class="card-header">
+            <div class="card-title-group">
+              <span class="card-icon card-icon--emerald" aria-hidden="true">
+                <svg viewBox="0 0 20 20" width="15" height="15" fill="none">
+                  <path d="M10 2.5L16.5 6.25V13.75L10 17.5L3.5 13.75V6.25L10 2.5Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+                  <circle cx="10" cy="10" r="2.2" fill="currentColor"/>
+                </svg>
+              </span>
+              <h2 id="engineCardTitle" class="card-title" data-i18n="engine.title">推理引擎与加速模式</h2>
+            </div>
+            <span id="activeEnginePill" class="mini-badge mini-badge--blue">Maya</span>
+          </div>
+
+          <!-- Segmented Switcher -->
+          <div class="segmented-control" role="tablist" aria-label="引擎切换">
+            <button id="segEngineMaya" class="seg-btn is-active" type="button" role="tab" aria-selected="true" data-engine="maya">
+              Project Maya (ds4)
+            </button>
+            <button id="segEngineStrata" class="seg-btn" type="button" role="tab" aria-selected="false" data-engine="strata">
+              Strata Engine (strata)
+            </button>
+          </div>
+
+          <!-- Maya 5 Modes Panel -->
+          <div id="mayaModePanel" class="engine-subpanel">
+            <div id="mayaModesList" class="mode-cards" role="radiogroup" aria-label="Maya 加速模式">
+              <!-- Populated/enhanced by app.js, static defaults rendered for immediate paint -->
+            </div>
+
+            <!-- Collapsible Advanced Options -->
+            <details id="mayaAdvancedDetails" class="advanced-box">
+              <summary class="advanced-summary">
+                <span data-i18n="engine.advancedOptions">高级选项 (HF Repo / 上下文 / 双模阈值)</span>
+                <span class="chevron" aria-hidden="true">▾</span>
+              </summary>
+              <div class="advanced-body">
+                <div class="field-group">
+                  <label for="hfRepoInput" class="field-label">HF Repo</label>
+                  <input id="hfRepoInput" class="text-input mono" type="text" placeholder="Org/Model-GGUF" autocomplete="off">
+                </div>
+                <div class="grid-2col">
+                  <div class="field-group">
+                    <label for="s2GcsThreshInput" class="field-label">S2_GCS_THRESH</label>
+                    <input id="s2GcsThreshInput" class="text-input mono tabular-nums" type="number" value="160" min="0" step="1">
+                  </div>
+                  <div class="field-group">
+                    <label for="s2LocalMaxInput" class="field-label">S2_LOCAL_MAX</label>
+                    <input id="s2LocalMaxInput" class="text-input mono tabular-nums" type="number" value="16" min="1" step="1">
+                  </div>
+                </div>
+                <div class="grid-2col">
+                  <div class="field-group">
+                    <label for="mayaContextSelect" class="field-label" data-i18n="engine.contextLimit">上下文配置</label>
+                    <select id="mayaContextSelect" class="select-input tabular-nums">
+                      <option value="262144">262144 (256K 默认)</option>
+                      <option value="65536">65536 (64K 省内存)</option>
+                    </select>
+                  </div>
+                  <div class="field-group">
+                    <label class="field-label" data-i18n="engine.visionLabel">视觉多模态</label>
+                    <button id="btnVisionToggle" class="switch-pill switch-pill--wide is-on" type="button" role="switch" aria-checked="true">
+                      <span class="switch-track"><span class="switch-thumb"></span></span>
+                      <span id="visionToggleText" class="switch-text">--vision on</span>
+                    </button>
+                  </div>
+                </div>
+                <button id="btnApplyMayaConfig" class="btn btn--secondary btn--sm btn--block" type="button" data-i18n="engine.saveMayaConfig">
+                  保存 Maya 配置
+                </button>
+              </div>
+            </details>
+          </div>
+
+          <!-- Strata Engine Panel -->
+          <div id="strataModePanel" class="engine-subpanel hidden">
+            <div class="info-callout" data-i18n="strata.callout">
+              支持直连远端或局域网 Strata 节点（兼容 /health、/status、/metrics 与 /v1/*），也支持在 Colab 通过 --engine strata 启动并挂载。
+            </div>
+            <div class="field-group">
+              <label for="strataUrlInput" class="field-label" data-i18n="strata.urlLabel">Strata 节点地址 (Upstream URL)</label>
+              <input id="strataUrlInput" class="text-input mono" type="url" placeholder="http://192.168.x.x:18181 或 https://<random-subdomain>.trycloudflare.com" autocomplete="off" spellcheck="false">
+            </div>
+            <div class="grid-2col">
+              <div class="field-group">
+                <label for="strataModelInput" class="field-label" data-i18n="strata.modelLabel">模型 ID</label>
+                <input id="strataModelInput" class="text-input mono" type="text" placeholder="strata-model" autocomplete="off">
+              </div>
+              <div class="field-group">
+                <label for="strataMaxCtxInput" class="field-label" data-i18n="strata.maxCtxLabel">最大上下文</label>
+                <input id="strataMaxCtxInput" class="text-input mono tabular-nums" type="number" value="65536" min="1024" step="1024">
+              </div>
+            </div>
+            <div class="field-group">
+              <label for="strataApiKeyInput" class="field-label" data-i18n="strata.apiKeyLabel">可选 API Key</label>
+              <input id="strataApiKeyInput" class="text-input mono" type="password" placeholder="留空表示无需或沿用已保存密钥" autocomplete="new-password">
+            </div>
+            <button id="btnConnectStrata" class="btn btn--primary btn--block" type="button">
+              <span>🔌</span>
+              <span data-i18n="strata.connectBtn">一键直连并挂载 Strata</span>
+            </button>
+          </div>
+
+          <!-- Credentials Footer Strip -->
+          <button id="btnOpenCredentials" class="cred-strip" type="button">
+            <div class="cred-strip-top">
+              <span class="cred-title">
+                <span aria-hidden="true">🔐</span>
+                <span data-i18n="cred.stripTitle">外部凭据状态 (~/.config/maya-gcs/)</span>
+              </span>
+              <span class="cred-edit-link" data-i18n="common.manage">配置 ▸</span>
+            </div>
+            <div class="cred-dots">
+              <span class="cred-pill"><span id="dotHfToken" class="dot dot--muted"></span>HF Token</span>
+              <span class="cred-pill"><span id="dotGcsKey" class="dot dot--muted"></span>GCS Key</span>
+              <span class="cred-pill"><span id="dotBucket" class="dot dot--muted"></span><span id="credBucketLabel">Bucket</span></span>
+              <span class="cred-pill"><span id="dotStrataKey" class="dot dot--muted"></span>Strata Key</span>
+            </div>
+          </button>
+        </section>
+      </aside>
+
+      <!-- CENTER STAGE: WebUI Console, Telemetry & Clients -->
+      <section class="col-center" aria-label="WebUI 控制台与实时遥测">
+        <!-- Stage Top Toolbar -->
+        <div class="stage-toolbar">
+          <div class="stage-toolbar-row">
+            <div class="stage-tabs" role="tablist">
+              <button id="tabBtnConsole" class="stage-tab is-active" type="button" role="tab" aria-selected="true" data-tab="console">
+                <span>🖥️</span>
+                <span data-i18n="tabs.console">原生 WebUI 控制台</span>
+              </button>
+              <button id="tabBtnTelemetry" class="stage-tab" type="button" role="tab" aria-selected="false" data-tab="telemetry">
+                <span>📊</span>
+                <span data-i18n="tabs.telemetry">实时遥测与对话探针</span>
+              </button>
+              <button id="tabBtnClients" class="stage-tab" type="button" role="tab" aria-selected="false" data-tab="clients">
+                <span>🔌</span>
+                <span data-i18n="tabs.clients">客户端一键接入</span>
+              </button>
+            </div>
+
+            <div class="stage-actions">
+              <button id="btnReloadIframe" class="btn btn--ghost btn--xs" type="button" title="刷新内嵌页面">
+                <span>↻</span>
+                <span data-i18n="stage.reloadEmbed">刷新内嵌页</span>
+              </button>
+              <button id="btnSyncPiQuick" class="btn btn--primary btn--xs" type="button">
+                <span data-i18n="stage.syncPi">一键同步至 Pi</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="stage-addr-bar">
+            <div class="addr-pill" title="上游隧道或直连地址">
+              <span class="addr-label" data-i18n="stage.upstream">上游</span>
+              <span id="upstreamAddrText" class="addr-value mono-ellipsis tabular-nums">未绑定</span>
+              <button id="btnCopyUpstream" class="copy-mini-btn" type="button" title="复制上游地址" data-copy-target="upstream">复制</button>
+            </div>
+
+            <div class="addr-pill addr-pill--proxy" title="本地同源固定代理网关">
+              <span class="addr-label" data-i18n="stage.localProxy">网关</span>
+              <span id="proxyAddrText" class="addr-value mono tabular-nums">http://127.0.0.1:18766/v1</span>
+              <button id="btnCopyProxy" class="copy-mini-btn" type="button" title="复制本地网关地址" data-copy-target="proxy">复制</button>
+            </div>
+
+            <span id="stageModelPill" class="model-chip mono-ellipsis hidden"></span>
+          </div>
+        </div>
+
+        <!-- Stage Body -->
+        <div class="stage-body">
+          <!-- TAB 1: Embedded Native WebUI / Deployment Pipeline -->
+          <div id="tabPanelConsole" class="tab-panel tab-panel--console is-active">
+            <!-- Online Embedded Iframe View -->
+            <div id="consoleOnlineWrap" class="iframe-wrap hidden">
+              <div class="iframe-bar">
+                <div class="iframe-bar-left">
+                  <span id="iframeStatusDot" class="dot dot--green"></span>
+                  <span id="iframeStatusLabel" class="iframe-bar-text mono tabular-nums">已通过本地同源代理 127.0.0.1:18766 接入原生控制台</span>
+                </div>
+                <div class="iframe-bar-actions">
+                  <span id="iframeLoadingChip" class="loading-chip hidden" data-i18n="stage.iframeLoading">正在加载内嵌界面...</span>
+                  <button id="btnFallbackNewTab" class="btn btn--ghost btn--xs" type="button" data-i18n="stage.fallbackOpen">
+                    若外部页阻止嵌入可新窗口打开 ↗
+                  </button>
+                </div>
+              </div>
+              <iframe id="engineWebuiFrame" class="engine-iframe" title="Maya / Strata 原生 WebUI 控制台" allow="clipboard-read; clipboard-write"></iframe>
+            </div>
+
+            <!-- Offline / Deploying Pipeline View -->
+            <div id="consoleOfflineWrap" class="offline-stage">
+              <div class="pipeline-card">
+                <div class="pipeline-header">
+                  <div>
+                    <h3 class="pipeline-title" data-i18n="deploy.pipelineTitle">云端推理引擎部署流水线</h3>
+                    <p id="deployStatusSummary" class="pipeline-subtitle" data-i18n="deploy.idleSummary">
+                      当前未连接到在线引擎。你可以启动全新 Colab 部署、无损纳管运行中的实例，或接入局域网/远端 Strata 节点。
+                    </p>
+                  </div>
+                  <span id="deployStepCounter" class="step-counter tabular-nums">0 / 6</span>
+                </div>
+
+                <div class="pipeline-progress-track">
+                  <div id="deployProgressBar" class="pipeline-progress-fill" style="width: 0%;"></div>
+                </div>
+
+                <div id="deployStepsGrid" class="pipeline-steps">
+                  <!-- Rendered dynamically for steps 1..6 -->
+                </div>
+
+                <div id="deployErrorBanner" class="error-banner hidden" role="alert"></div>
+              </div>
+
+              <div class="quick-attach-card">
+                <div class="quick-attach-info">
+                  <h4 class="quick-attach-title" data-i18n="deploy.quickAttachTitle">已有运行中的 easycolab 实例？</h4>
+                  <p class="quick-attach-desc" data-i18n="deploy.quickAttachDesc">
+                    使用只读无损纳管探测 GPU、/mnt/hf 挂载与 Cloudflare 隧道并立即挂载至本地 127.0.0.1:18766，完全不打断现有服务与保活守护。
+                  </p>
+                </div>
+                <div class="quick-attach-actions">
+                  <button id="btnQuickAttachCenter" class="btn btn--primary" type="button">
+                    <span>🔗</span>
+                    <span data-i18n="deploy.quickAttachBtn">一键无损纳管 easycolab</span>
+                  </button>
+                  <button id="btnQuickStrataCenter" class="btn btn--secondary" type="button" data-i18n="deploy.quickStrataBtn">
+                    配置 Strata 直连
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- TAB 2: Live Telemetry & Chat Probe -->
+          <div id="tabPanelTelemetry" class="tab-panel tab-panel--scroll">
+            <div class="kpi-grid">
+              <div class="kpi-card">
+                <span class="kpi-label">Prefill tok/s</span>
+                <strong id="kpiPrefill" class="kpi-value tabular-nums">--</strong>
+                <span class="kpi-sub" data-i18n="telemetry.prefillSub">最近一次提示词吞吐</span>
+              </div>
+              <div class="kpi-card">
+                <span class="kpi-label">Decode tok/s</span>
+                <strong id="kpiDecode" class="kpi-value kpi-value--emerald tabular-nums">--</strong>
+                <span class="kpi-sub" data-i18n="telemetry.decodeSub">最近一次稳态生成</span>
+              </div>
+              <div class="kpi-card">
+                <span class="kpi-label" data-i18n="telemetry.vramHit">VRAM 命中率</span>
+                <strong id="kpiVramHit" class="kpi-value kpi-value--blue tabular-nums">--</strong>
+                <span class="kpi-sub" data-i18n="telemetry.vramSub">热点专家显存驻留</span>
+              </div>
+              <div class="kpi-card">
+                <span class="kpi-label" data-i18n="telemetry.totalReq">总请求数</span>
+                <strong id="kpiRequests" class="kpi-value tabular-nums">--</strong>
+                <span class="kpi-sub" data-i18n="telemetry.totalReqSub">累计服务推理次数</span>
+              </div>
+              <div class="kpi-card">
+                <span class="kpi-label" data-i18n="telemetry.queue">活跃队列</span>
+                <strong id="kpiQueue" class="kpi-value kpi-value--amber tabular-nums">--</strong>
+                <span id="kpiBusySub" class="kpi-sub" data-i18n="telemetry.idle">空闲待命中</span>
+              </div>
+            </div>
+
+            <div class="telemetry-split">
+              <!-- Recent Requests Table -->
+              <section class="sub-card">
+                <div class="sub-card-header">
+                  <h3 class="sub-card-title" data-i18n="telemetry.recentRequests">最近请求摘要</h3>
+                  <span id="recentReqCount" class="mini-badge mini-badge--muted tabular-nums">0 条</span>
+                </div>
+                <div class="table-wrap">
+                  <table class="data-table">
+                    <thead>
+                      <tr>
+                        <th data-i18n="table.time">时间 / ID</th>
+                        <th data-i18n="table.tokens">Tokens (In / Out)</th>
+                        <th class="num">Prefill</th>
+                        <th class="num">Decode</th>
+                        <th data-i18n="table.status">状态</th>
+                      </tr>
+                    </thead>
+                    <tbody id="recentRequestsBody">
+                      <tr>
+                        <td colspan="5" class="table-empty" data-i18n="table.empty">暂无最近请求遥测记录</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+
+              <!-- Compact Chat Probe -->
+              <section class="sub-card">
+                <div class="sub-card-header">
+                  <h3 class="sub-card-title" data-i18n="probe.title">精简对话探针 (/v1/chat/completions)</h3>
+                  <span id="probeLatencyBadge" class="mini-badge mini-badge--muted tabular-nums">-- ms</span>
+                </div>
+                <div class="probe-form">
+                  <textarea id="probePromptInput" class="textarea-input" rows="3" placeholder="输入测试提示词以验证 /v1/chat/completions 连通性与实时吞吐...">请用一句话简述你的状态，并确认当前连接正常。</textarea>
+                  <div class="probe-controls">
+                    <div class="probe-max-tokens">
+                      <label for="probeMaxTokens" class="field-label" data-i18n="probe.maxTokens">max_tokens</label>
+                      <select id="probeMaxTokens" class="select-input select-input--sm tabular-nums">
+                        <option value="64">64</option>
+                        <option value="128" selected>128</option>
+                        <option value="256">256</option>
+                        <option value="512">512</option>
+                      </select>
+                    </div>
+                    <button id="btnRunProbe" class="btn btn--primary btn--sm" type="button">
+                      <span>🚀</span>
+                      <span data-i18n="probe.sendBtn">发送探针测试</span>
+                    </button>
+                  </div>
+                </div>
+                <div id="probeOutputBox" class="probe-output hidden">
+                  <div class="probe-output-meta tabular-nums" id="probeOutputMeta"></div>
+                  <pre id="probeOutputText" class="probe-output-pre"></pre>
+                </div>
+              </section>
+            </div>
+          </div>
+
+          <!-- TAB 3: One-Click Client Integration -->
+          <div id="tabPanelClients" class="tab-panel tab-panel--scroll">
+            <section class="sub-card">
+              <div class="sub-card-header">
+                <div>
+                  <h3 class="sub-card-title" data-i18n="clients.piTitle">Pi &amp; pi-web 自动同步</h3>
+                  <p class="sub-card-desc" data-i18n="clients.piDesc">
+                    自动写入 $HOME/.pi/agent/models.json 并刷新本地 pi-web (127.0.0.1:30141)，推荐优先绑定本地同源网关 http://127.0.0.1:18766/v1。
+                  </p>
+                </div>
+                <div class="pi-sync-actions">
+                  <label class="checkbox-inline">
+                    <input id="chkUseLocalProxy" type="checkbox" checked>
+                    <span data-i18n="clients.useLocalProxy">使用本地代理 (推荐)</span>
+                  </label>
+                  <button id="btnSyncPiPanel" class="btn btn--primary btn--sm" type="button" data-i18n="clients.syncNow">
+                    立即同步至 Pi
+                  </button>
+                </div>
+              </div>
+              <div id="piSyncResultBox" class="sync-result-box">
+                <span class="muted-text" data-i18n="clients.syncIdle">点击上方按钮可将当前活跃模型与 Base URL 写入本地 Pi 客户端配置。</span>
+              </div>
+            </section>
+
+            <div class="snippets-grid">
+              <article class="snippet-card">
+                <div class="snippet-header">
+                  <strong>Pi (~/.pi/agent/models.json)</strong>
+                  <button class="btn btn--ghost btn--xs copy-snippet-btn" type="button" data-snippet="pi">复制</button>
+                </div>
+                <pre id="snippetPi" class="code-block"></pre>
+              </article>
+
+              <article class="snippet-card">
+                <div class="snippet-header">
+                  <strong>Cursor / OpenAI Compatible</strong>
+                  <button class="btn btn--ghost btn--xs copy-snippet-btn" type="button" data-snippet="cursor">复制</button>
+                </div>
+                <pre id="snippetCursor" class="code-block"></pre>
+              </article>
+
+              <article class="snippet-card">
+                <div class="snippet-header">
+                  <strong>Claude Code (Anthropic Messages API)</strong>
+                  <button class="btn btn--ghost btn--xs copy-snippet-btn" type="button" data-snippet="claude">复制</button>
+                </div>
+                <pre id="snippetClaude" class="code-block"></pre>
+              </article>
+
+              <article class="snippet-card">
+                <div class="snippet-header">
+                  <strong>OpenAI Python SDK</strong>
+                  <button class="btn btn--ghost btn--xs copy-snippet-btn" type="button" data-snippet="openai">复制</button>
+                </div>
+                <pre id="snippetOpenai" class="code-block"></pre>
+              </article>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- RIGHT COLUMN: Low-level Commands & Live Logs -->
+      <aside class="col-right" aria-label="底层命令与实时日志">
+        <div class="log-panel-card">
+          <div class="card-header log-header">
+            <div class="card-title-group">
+              <span class="card-icon card-icon--slate" aria-hidden="true">
+                <svg viewBox="0 0 20 20" width="15" height="15" fill="none">
+                  <path d="M4.5 6.5L8 10L4.5 13.5M9.5 13.5H15.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </span>
+              <h2 class="card-title" data-i18n="logs.title">底层命令与实时日志</h2>
+            </div>
+            <div id="sseStatusBadge" class="sse-badge sse-badge--connecting">
+              <span class="dot dot--amber"></span>
+              <span id="sseStatusText" data-i18n="logs.connecting">连接中</span>
+            </div>
+          </div>
+
+          <!-- Log Filter Pills -->
+          <div class="log-controls">
+            <div id="logCategoryPills" class="filter-pills" role="tablist" aria-label="日志分类过滤">
+              <button class="filter-pill is-active" type="button" data-cat="all" data-i18n="logs.catAll">全部</button>
+              <button class="filter-pill" type="button" data-cat="deploy" data-i18n="logs.catDeploy">部署</button>
+              <button class="filter-pill" type="button" data-cat="colab" data-i18n="logs.catColab">Colab</button>
+              <button class="filter-pill" type="button" data-cat="keepalive" data-i18n="logs.catKeepalive">保活</button>
+              <button class="filter-pill" type="button" data-cat="cmd" data-i18n="logs.catCmd">命令</button>
+            </div>
+
+            <div class="log-search-row">
+              <input id="logSearchInput" class="text-input text-input--sm" type="search" placeholder="搜索日志关键词..." autocomplete="off">
+              <button id="btnAutoScroll" class="btn btn--ghost btn--xs is-toggled" type="button" title="自动滚底锁定" data-i18n="logs.autoScroll">滚底</button>
+              <button id="btnCopyLogs" class="btn btn--ghost btn--xs" type="button" title="复制当前过滤日志" data-i18n="common.copy">复制</button>
+              <button id="btnClearLogs" class="btn btn--ghost btn--xs" type="button" title="清空本地日志视图" data-i18n="logs.clear">清空</button>
+            </div>
+          </div>
+
+          <!-- Streaming Terminal Feed -->
+          <div id="logViewport" class="log-viewport" role="log" aria-live="polite">
+            <div id="logEmptyState" class="log-empty">正在订阅 /api/studio/logs/stream 实时日志流...</div>
+            <div id="logLinesContainer" class="log-lines"></div>
+          </div>
+
+          <!-- Quick Diagnostics & Custom Command Input -->
+          <div class="cmd-footer">
+            <div class="cmd-chips-header">
+              <span class="field-label" data-i18n="logs.quickDiag">快捷安全诊断</span>
+              <span id="cmdExecStatus" class="cmd-exec-status"></span>
+            </div>
+            <div class="diag-chips">
+              <button class="diag-chip" type="button" data-preset="nvidia_smi">GPU 显存 (nvidia-smi)</button>
+              <button class="diag-chip" type="button" data-preset="mounts">挂载与磁盘 (df -h)</button>
+              <button class="diag-chip" type="button" data-preset="tail_engine">远端引擎日志</button>
+              <button class="diag-chip" type="button" data-preset="processes">进程与隧道</button>
+              <button class="diag-chip" type="button" data-preset="colab_usage">Colab 额度</button>
+            </div>
+            <form id="customCmdForm" class="cmd-input-row">
+              <span class="cmd-prompt">$</span>
+              <input id="customCmdInput" class="cmd-input mono" type="text" placeholder="输入安全诊断命令并回车运行..." autocomplete="off" spellcheck="false">
+              <button id="btnRunCustomCmd" class="btn btn--primary btn--xs" type="submit" data-i18n="logs.runCmd">运行</button>
+            </form>
+          </div>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <!-- MODALS -->
+  <!-- 1. OAuth Modal -->
+  <div id="authModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="authModalTitle">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="authModalTitle" class="modal-title" data-i18n="modal.authTitle">Google Colab OAuth 账号授权</h3>
+        <button class="modal-close" type="button" data-close-modal="authModal" aria-label="关闭">✕</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-desc" data-i18n="modal.authDesc">
+          获取 Google OAuth 授权链接并在浏览器完成登录，然后将重定向地址或授权码 (Code) 粘贴到下方提交。
+        </p>
+        <div class="field-group">
+          <div class="field-label-row">
+            <label class="field-label" data-i18n="modal.authUrlLabel">步骤 1：获取并打开授权链接</label>
+            <button id="btnFetchAuthUrl" class="btn btn--secondary btn--xs" type="button" data-i18n="modal.genAuthUrl">生成授权链接</button>
+          </div>
+          <div class="copy-input-row">
+            <input id="oauthUrlDisplay" class="text-input mono" type="text" readonly placeholder="点击右侧“生成授权链接”...">
+            <button id="btnOpenAuthUrl" class="btn btn--ghost btn--xs" type="button" disabled data-i18n="common.open">打开</button>
+            <button id="btnCopyAuthUrl" class="btn btn--ghost btn--xs" type="button" disabled data-i18n="common.copy">复制</button>
+          </div>
+        </div>
+        <div class="field-group">
+          <label for="oauthCodeInput" class="field-label" data-i18n="modal.authCodeLabel">步骤 2：粘贴授权码或回调 URL</label>
+          <input id="oauthCodeInput" class="text-input mono" type="text" placeholder="粘贴 authorization code 或完整回调链接..." autocomplete="off">
+        </div>
+        <div id="authModalFeedback" class="modal-feedback hidden"></div>
+      </div>
+      <div class="modal-footer modal-footer--split">
+        <button id="btnAuthLogout" class="btn btn--danger-outline btn--sm" type="button" data-i18n="modal.logoutBtn">退出当前账号</button>
+        <div class="modal-footer-right">
+          <button class="btn btn--ghost btn--sm" type="button" data-close-modal="authModal" data-i18n="common.cancel">取消</button>
+          <button id="btnSubmitAuthCode" class="btn btn--primary btn--sm" type="button" data-i18n="modal.submitAuth">提交授权</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 2. Stop Confirmation Modal -->
+  <div id="stopConfirmModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="stopModalTitle">
+    <div class="modal-card modal-card--sm">
+      <div class="modal-header">
+        <h3 id="stopModalTitle" class="modal-title modal-title--danger" data-i18n="modal.stopTitle">确认释放云端 Colab 实例？</h3>
+        <button class="modal-close" type="button" data-close-modal="stopConfirmModal" aria-label="关闭">✕</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-desc">
+          即将释放会话 <strong id="stopSessionDisplay" class="mono">easycolab</strong> 的云端 GPU 运行时并停止其保活守护。正在运行的推理服务将立即中断。
+        </p>
+        <div class="warning-box" data-i18n="modal.stopWarn">
+          ⚠️ 此操作不可撤销：未持久化的内存状态和临时容器数据将会被回收。请确认后再继续。
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn--ghost btn--sm" type="button" data-close-modal="stopConfirmModal" data-i18n="common.cancel">取消保留</button>
+        <button id="btnConfirmStop" class="btn btn--danger btn--sm" type="button" data-i18n="modal.confirmStop">确认释放实例</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 3. Credentials Modal -->
+  <div id="credentialsModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="credModalTitle">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="credModalTitle" class="modal-title" data-i18n="modal.credTitle">外部安全凭据设置 (~/.config/maya-gcs/)</h3>
+        <button class="modal-close" type="button" data-close-modal="credentialsModal" aria-label="关闭">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="info-callout" data-i18n="modal.credSecurityNote">
+          所有凭据仅以目录 0700 / 文件 0600 权限存储在本地 ~/.config/maya-gcs/，绝不会提交至仓库或暴露明文回显。留空项将保持原有文件不变。
+        </div>
+        <div class="field-group">
+          <label for="credHfTokenInput" class="field-label">Hugging Face Token (hf-token)</label>
+          <input id="credHfTokenInput" class="text-input mono" type="password" placeholder="hf_your_huggingface_token（留空保持不变）" autocomplete="new-password">
+        </div>
+        <div class="field-group">
+          <label for="credBucketInput" class="field-label">GCS Bucket (bucket)</label>
+          <input id="credBucketInput" class="text-input mono" type="password" placeholder="your-gcs-bucket-name（留空保持不变）" autocomplete="off">
+        </div>
+        <div class="field-group">
+          <div class="field-label-row">
+            <label for="credGcsKeyInput" class="field-label">GCS Service Account JSON (gcs-key.json)</label>
+            <label class="btn btn--ghost btn--xs file-pick-btn">
+              <span data-i18n="modal.pickJsonFile">导入本地 .json</span>
+              <input id="credGcsKeyFile" type="file" accept=".json,application/json" class="hidden">
+            </label>
+          </div>
+          <textarea id="credGcsKeyInput" class="textarea-input mono masked-textarea" rows="3" placeholder="粘贴 Service Account JSON 内容或点击右上角导入文件（已遮蔽防录屏泄露）" autocomplete="off" spellcheck="false"></textarea>
+        </div>
+        <div class="field-group">
+          <label for="credStrataKeyInput" class="field-label">Strata API Key (strata-api-key)</label>
+          <input id="credStrataKeyInput" class="text-input mono" type="password" placeholder="可选 Strata 节点访问密钥（留空保持不变）" autocomplete="new-password">
+        </div>
+        <div id="credModalFeedback" class="modal-feedback hidden"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn--ghost btn--sm" type="button" data-close-modal="credentialsModal" data-i18n="common.cancel">取消</button>
+        <button id="btnSaveCredentials" class="btn btn--primary btn--sm" type="button" data-i18n="modal.saveCreds">安全保存凭据</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 4. Guide Modal -->
+  <div id="guideModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="guideModalTitle">
+    <div class="modal-card modal-card--lg">
+      <div class="modal-header">
+        <h3 id="guideModalTitle" class="modal-title" data-i18n="modal.guideTitle">Maya · Strata Studio 快速接入指南</h3>
+        <button class="modal-close" type="button" data-close-modal="guideModal" aria-label="关闭">✕</button>
+      </div>
+      <div class="modal-body guide-body">
+        <div class="guide-section">
+          <h4>1. 无损纳管已有 Colab 实例（推荐）</h4>
+          <p>若你在后台已有正在运行的 <code>easycolab</code> G4 会话，请勿重复点击部署。直接点击左侧<strong>「🔗 无损纳管已运行会话」</strong>，Studio 会以只读方式探测 GPU、<code>/mnt/hf</code> 挂载和 <code>cloudflared</code> 隧道，并将同源代理绑定至 <code>http://127.0.0.1:18766</code>。</p>
+        </div>
+        <div class="guide-section">
+          <h4>2. G4 与加速模式说明</h4>
+          <ul>
+            <li><strong>Mode B1 (默认推荐)</strong>：Shards 1–4 走 HF Xet (~305 MiB/s) 落 NVMe，Shards 5–7 通过 <code>/mnt/hf</code> FUSE3 + HTTP/2 Range 直连，零冷启 GCS 流量；<code>Shard 00002</code> 启用双模阈值 (<code>MAYA_S2_GCS_THRESH=160</code>)。</li>
+            <li><strong>G4 机型防呆</strong>：Colab G4 仅支持单规格 Standard (176.9GB RAM)，创建时自动省略 <code>--high-mem</code>。</li>
+            <li><strong>Strata Engine</strong>：可直连任意远端/局域网 Strata 服务（如 <code>http://192.168.x.x:18181</code> 或 <code>https://&lt;random-subdomain&gt;.trycloudflare.com</code>）。</li>
+          </ul>
+        </div>
+        <div class="guide-section">
+          <h4>3. 隐私保护与安全规范</h4>
+          <p>本机凭据一律存放在 <code>$HOME/.config/maya-gcs/</code>（或 <code>/Users/&lt;username&gt;/.config/maya-gcs/</code>）。演示或录屏时请保持右上角<strong>「👁️ 录屏隐私打码」</strong>开启，自动遮蔽邮箱、隧道域名与 Bucket 名称。</p>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn--primary btn--sm" type="button" data-close-modal="guideModal" data-i18n="common.gotIt">我知道了</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Stack -->
+  <div id="toastStack" class="toast-stack" aria-live="polite"></div>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

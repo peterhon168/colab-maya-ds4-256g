@@ -16,6 +16,12 @@ hf-token
 !resources/*.example
 !scripts/audit_secrets.py
 
+# macOS App bundle & packaging artifacts
+MayaStudio.app/
+*.zip
+build/
+*.log
+
 # OS / editor / temporary build junk
 .DS_Store
 __MACOSX/

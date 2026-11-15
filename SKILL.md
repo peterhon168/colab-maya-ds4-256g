@@ -207,3 +207,49 @@ EOF
 - **Power-Scaling & Topology Takeaways**:
   - **Asymmetric TDP Scaling (`r/BlackwellPerformance`)**: Long-context prefill is compute-bound and scales strongly up to `600W`, whereas `T=1` decode is GDDR7-bandwidth-bound and hits an efficiency knee around **`300–350W`** (capping at `300–350W` retains `92–97%` decode speed for ~30% lower power; **always keep `600W` unlocked + `nvidia-smi -pm 1` on G4** so prefill runs at full speed).
   - **PCIe Gen 5 (No NVLink)**: Multi-card TP across PCIe Gen 5 incurs AllReduce fabric overhead (Google Titanium direct P2P helps multi-GPU G4 clusters), whereas on single-card hybrid MoE (`project-maya`), `T=1` PCIe streaming regresses decode by `+8.4%` (`38.25 vs 35.29 ms/tok`), so pinning 100% of active weights across `96 GB` VRAM + `145.4 GB` DDR5 RAM is strictly optimal.
+
+---
+
+## 6. Maya · Strata Studio 桌面工作台 & WebUI
+
+Beyond headless CLI scripts, the repository ships **Maya · Strata Studio** (`studio/`, `macos_app/`, `scripts/launch_studio.sh`): a Python 3 standard-library control plane (`127.0.0.1:18765`), transparent same-origin reverse proxy & OpenAI `/v1` gateway (`127.0.0.1:18766`), and an Xcode-free native macOS desktop wrapper (`MayaStudio.app`).
+
+### Three-Column Workbench Architecture
+- **Top Control Bar**: Connection status pill, engine & GPU badges, `示例接入指南`, external browser launcher, `中 / EN` toggle, and **Screen-Recording Privacy Mask (`录屏隐私打码`)**. In `MayaStudio.app` (`?shell=macos`), `78px` left padding clears the native macOS traffic-light buttons.
+- **Left Panel (`Colab 算力实例 & 额度` + `推理引擎与加速模式`)**:
+  - Google OAuth PKCE login/refresh, GPU selector (`G4` never sends `--high-mem`; only `A100` uses `--high-mem`), session input, `⚡ 唤醒实例并部署`, `🔗 无损纳管已运行会话`, CU balance / hourly burn rate, `12m 保活` switch, and confirmation-guarded stop.
+  - Segmented engine switcher: **Project Maya (`ds4`)** with 5 selectable mode cards (`Mode B1`, `Mode B1-Pure`, `Mode A`, `Mode B1-GCS`, `Mode B2` + collapsible `HF Repo` / `MAYA_S2_GCS_THRESH` / `MAYA_S2_LOCAL_MAX` / context / `--vision` options) vs. **Strata Engine (`strata`)**, plus the `~/.config/maya-gcs/` credentials status bar.
+- **Center Stage**:
+  - `🖥️ 原生 WebUI 控制台`: Same-origin `<iframe>` pointing to `http://127.0.0.1:18766/` (proxied Maya `:8000` or Strata Dashboard with `X-Frame-Options` / `frame-ancestors` stripped and upstream `Host`/`Origin` rewritten for `_own_page()` compatibility), or a 6-step deployment pipeline + one-click `easycolab` attach card when offline.
+  - `📊 实时遥测与对话探针`: Live `Prefill tok/s`, `Decode tok/s`, `VRAM 命中率`, `总请求数`, `活跃队列`, recent requests table, and `/v1/chat/completions` probe.
+  - `🔌 客户端一键接入`: One-click sync to `~/.pi/agent/models.json` / `pi-web` (`127.0.0.1:30141`) and copyable configs for Cursor, Claude Code, and OpenAI SDKs.
+- **Right Panel**: Real-time `/api/studio/logs/stream` SSE viewer with category filters, search, and diagnostic quick-exec chips (`nvidia-smi`, `df -h`, remote engine log tail, processes/tunnels, Colab quota, custom exec).
+
+### Build & Launch Commands
+
+```bash
+# 1. macOS native MayaStudio.app (Xcode-free swiftc + CoreGraphics AppIcon.icns + ad-hoc codesign)
+bash macos_app/build_macos_app.sh
+codesign --verify --deep --strict MayaStudio.app
+open MayaStudio.app
+
+# 2. Cross-platform Python CLI launch (macOS / Linux, stdlib only)
+python3 -m studio --host 127.0.0.1 --port 18765 --proxy-port 18766 --auto-attach
+
+# 3. Unified launcher script
+bash scripts/launch_studio.sh                 # macOS: opens MayaStudio.app (or falls back to --web)
+bash scripts/launch_studio.sh --web           # Force Python WebUI server + open default browser
+bash scripts/launch_studio.sh --daemon        # Start background daemon and return immediately
+bash scripts/launch_studio.sh --port 18765    # Custom control plane port
+```
+
+- **Reuse & Safe Exit**: Both `MayaStudio.app` and `scripts/launch_studio.sh` probe `127.0.0.1:18765` first; if an existing Studio server is running, they reuse it directly without killing external workflows. On exit, `MayaStudio.app` only terminates (`SIGTERM`) a child `studio` process that it spawned itself, leaving external services, `keepalive_colab.sh`, and remote Colab VMs untouched.
+
+### Non-Destructive `easycolab` Attach & Strata Engine Support
+- **Read-Only Attach (`POST /api/studio/colab/attach`)**: Inspects an already-running `easycolab` session via a single read-only `colab exec` probe (GPU model, `/mnt/hf` / `/mnt/local-scratch` mounts, `maya-ds4` / `strata` status, latest `cloudflared` tunnel URL) and checks local `pgrep -f "keepalive_colab.sh"` status without interrupting active inference or restarting the VM.
+- **Strata Engine (`strata`)**: Switch to **Strata Engine** in the left panel or call `POST /api/studio/engine/configure` to connect directly to a LAN/remote Strata endpoint (e.g. `http://192.168.x.x:18181` or `https://<random-subdomain>.trycloudflare.com`), or deploy on Colab with `--engine strata`. The `:18766` reverse proxy forwards `/health`, `/status`, `/metrics`, `/v1/models`, `/v1/chat/completions`, and the Strata dashboard seamlessly.
+
+### Credential Security & Sanitization Rules
+- Store user secrets strictly outside Git in `~/.config/maya-gcs/` (`chmod 700` dir, `chmod 600` files: `hf-token`, `gcs-key.json`, `bucket`, `strata-api-key`).
+- `build_macos_app.sh` excludes `gcs-key.json`, `gcs-bucket`, `hf-token`, `*.key`, `*.pem`, `.env*`, `*secret*`, and `*credential*` from `MayaStudio.app`, and avoids hardcoding `/Users/<username>` paths by resolving `MAYA_STUDIO_ROOT`, `.app` parent directories, or `Contents/Resources/` dynamically.
+- Keep **录屏隐私打码** enabled when capturing screenshots/recordings, and always run `python3 scripts/audit_secrets.py` before committing (`Findings count: 0`).
