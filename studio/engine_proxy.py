@@ -261,6 +261,12 @@ class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.socket.getsockname()[:2]
+        self.server_name = str(host)
+        self.server_port = int(port)
+
 
 class EngineProxyServer:
     """Runs the same-origin transparent HTTP/SSE reverse proxy on 127.0.0.1:<proxy_port>."""

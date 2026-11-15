@@ -518,6 +518,12 @@ class _StudioHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.socket.getsockname()[:2]
+        self.server_name = str(host)
+        self.server_port = int(port)
+
 
 class StudioServer:
     """HTTP + SSE server for Maya · Strata Studio (127.0.0.1:18765)."""

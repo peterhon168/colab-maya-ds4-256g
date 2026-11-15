@@ -44,21 +44,38 @@ jobs:
 
       - name: Smoke-test embedded Studio backend
         run: |
+          REPO_DIR="$PWD"
           TMP_HOME="$(mktemp -d)"
           PORT=18775
           PROXY_PORT=18776
-          HOME="$TMP_HOME" PI_WEB_URL=off PYTHONPATH="MayaStudio.app/Contents/Resources" \
-            python3 -m studio --host 127.0.0.1 --port "$PORT" --proxy-port "$PROXY_PORT" > "$TMP_HOME/studio.log" 2>&1 &
+          (
+            cd "$TMP_HOME"
+            HOME="$TMP_HOME" PI_WEB_URL=off NO_PROXY="127.0.0.1,localhost" \
+              PYTHONPATH="${REPO_DIR}/MayaStudio.app/Contents/Resources" \
+              python3 -u -m studio --host 127.0.0.1 --port "$PORT" --proxy-port "$PROXY_PORT" > "$TMP_HOME/studio.log" 2>&1
+          ) &
           PID=$!
           trap 'kill "$PID" 2>/dev/null || true; rm -rf "$TMP_HOME"' EXIT
-          for _ in $(seq 1 20); do
-            if curl -fsS "http://127.0.0.1:${PORT}/api/studio/state" >/dev/null 2>&1; then
+          READY=0
+          for _ in $(seq 1 40); do
+            if curl --noproxy '*' -fsS "http://127.0.0.1:${PORT}/api/studio/state" >/dev/null 2>&1; then
+              READY=1
               break
+            fi
+            if ! kill -0 "$PID" 2>/dev/null; then
+              echo "Studio process exited prematurely. Log:" >&2
+              cat "$TMP_HOME/studio.log" >&2 || true
+              exit 1
             fi
             sleep 0.5
           done
-          curl -fsS "http://127.0.0.1:${PORT}/api/studio/state" | python3 -c 'import json, sys; d = json.load(sys.stdin); assert d.get("ok") is True and len(d.get("modes_catalog", [])) == 5 and "has_maya_key" in d.get("credentials", {}), d; print("Studio /api/studio/state smoke test OK:", d["version"])'
-          FAV_CODE="$(curl -sS -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PORT}/favicon.ico")"
+          if [ "$READY" -ne 1 ]; then
+            echo "Studio failed to become ready within 20s. Log:" >&2
+            cat "$TMP_HOME/studio.log" >&2 || true
+            exit 1
+          fi
+          curl --noproxy '*' -fsS "http://127.0.0.1:${PORT}/api/studio/state" | python3 -c 'import json, sys; d = json.load(sys.stdin); assert d.get("ok") is True and len(d.get("modes_catalog", [])) == 5 and "has_maya_key" in d.get("credentials", {}), d; print("Studio /api/studio/state smoke test OK:", d["version"])'
+          FAV_CODE="$(curl --noproxy '*' -sS -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PORT}/favicon.ico")"
           test "$FAV_CODE" = "200"
           echo "Favicon HTTP status: $FAV_CODE"
 
