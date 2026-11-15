@@ -29,6 +29,580 @@ if [ -z "${HF_TOKEN:-}" ]; then
   fi
 fi
 
+write_refresher_script() {
+  mkdir -p "$WORK_DIR"
+  cat > "$WORK_DIR/maya_url_token_refresher.sh" << 'TEOF'
+#!/usr/bin/env bash
+set -u
+unset LD_PRELOAD
+
+HF_REPO="${MAYA_HF_REPO:-orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF}"
+HF_URLS_FILE="${MAYA_HF_URLS_PATH:-/dev/shm/.maya_hf_urls}"
+GCS_TOK_FILE="/dev/shm/.maya_gcs_token"
+GCLOUD_BIN="/tools/google-cloud-sdk/bin/gcloud"
+[ -x "$GCLOUD_BIN" ] || GCLOUD_BIN="$(command -v gcloud || true)"
+
+get_hf_token() {
+  local t="${HF_TOKEN:-}"
+  if [ -z "$t" ] && [ -f /tmp/hf-token ]; then
+    t="$(tr -d '[:space:]' < /tmp/hf-token 2>/dev/null || true)"
+  fi
+  if [ -z "$t" ] && [ -f /root/.cache/huggingface/token ]; then
+    t="$(tr -d '[:space:]' < /root/.cache/huggingface/token 2>/dev/null || true)"
+  fi
+  printf '%s' "$t"
+}
+
+refresh_hf_once() {
+  local hftok
+  hftok="$(get_hf_token)"
+  [ -n "$hftok" ] || return 1
+  HF_TOKEN="$hftok" python3 - "$HF_REPO" "$HF_URLS_FILE" << 'PY'
+import os, re, sys, time, urllib.error, urllib.parse, urllib.request
+
+repo, out_path = sys.argv[1], sys.argv[2]
+tok = os.environ.get("HF_TOKEN", "").strip()
+if not tok:
+    sys.exit(1)
+
+class NoRedir(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+op = urllib.request.build_opener(NoRedir)
+lines = []
+for idx in (5, 6, 7):
+    rel = f"Mix-256G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-0000{idx}-of-00007.gguf"
+    url = f"https://huggingface.co/{repo}/resolve/main/{rel}"
+    last_err = None
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, method="GET", headers={"Authorization": f"Bearer {tok}"})
+            cdn_url = None
+            try:
+                resp = op.open(req, timeout=20)
+                resp.close()
+            except urllib.error.HTTPError as e:
+                if e.code in (301, 302, 303, 307, 308):
+                    loc = e.headers.get("Location", "")
+                    if loc:
+                        cdn_url = urllib.parse.urljoin(url, loc)
+                else:
+                    raise
+            if not cdn_url:
+                raise RuntimeError(f"Missing redirect Location for {rel}")
+            probe = urllib.request.Request(cdn_url, headers={"Range": "bytes=0-0"})
+            with urllib.request.urlopen(probe, timeout=20) as r2:
+                if r2.status != 206:
+                    raise RuntimeError(f"Expected HTTP 206 on probe, got {r2.status}")
+                cr = r2.headers.get("Content-Range", "")
+                m = re.match(r"bytes\s+0-0/(\d+)", cr)
+                if not m:
+                    raise RuntimeError(f"Bad Content-Range: {cr}")
+                sz = int(m.group(1))
+                _ = r2.read(1)
+            lines.append(f"{rel}\t{sz}\t{cdn_url}\n")
+            last_err = None
+            break
+        except Exception as exc:
+            last_err = exc
+            time.sleep(1.5 * (attempt + 1))
+    if last_err is not None:
+        raise last_err
+
+tmp = f"{out_path}.tmp.{os.getpid()}"
+with open(tmp, "w") as f:
+    f.writelines(lines)
+os.chmod(tmp, 0o600)
+os.replace(tmp, out_path)
+PY
+}
+
+refresh_gcs_once() {
+  [ -n "$GCLOUD_BIN" ] && [ -f /tmp/gcs-key.json ] || return 1
+  local tok
+  tok="$(CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=/tmp/gcs-key.json "$GCLOUD_BIN" auth print-access-token 2>/dev/null | tr -d '[:space:]')"
+  [ -n "$tok" ] || return 1
+  local tmp="${GCS_TOK_FILE}.tmp.$$"
+  umask 077
+  printf '%s\n' "$tok" > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$GCS_TOK_FILE"
+}
+
+case "${1:-}" in
+  --hf-only)
+    refresh_hf_once
+    exit $?
+    ;;
+  --gcs-only)
+    refresh_gcs_once
+    exit $?
+    ;;
+  --once)
+    rc=0
+    if [ -n "$(get_hf_token)" ]; then
+      refresh_hf_once || rc=1
+    fi
+    if [ -f /tmp/gcs-key.json ]; then
+      refresh_gcs_once || rc=1
+    fi
+    exit $rc
+    ;;
+esac
+
+while true; do
+  refresh_hf_once || true
+  refresh_gcs_once || true
+  sleep 1200
+done
+TEOF
+  chmod 700 "$WORK_DIR/maya_url_token_refresher.sh"
+  ln -sf "$WORK_DIR/maya_url_token_refresher.sh" "$WORK_DIR/maya_gcs_token_refresher.sh"
+}
+
+write_hf_ro_fuse_c() {
+  cat > /tmp/hf_ro_fuse.c << 'HCEOF'
+/*
+ * hf_ro_fuse.c — Lightweight read-only FUSE3 filesystem backed by presigned Hugging Face CDN URLs.
+ *
+ * Build on Linux (Google Colab x86_64):
+ *   gcc -Wall -Wextra -Werror -O2 src/hf_ro_fuse.c -o hf_ro_fuse \
+ *       $(pkg-config --cflags --libs fuse3 libcurl) -lpthread
+ *
+ * Runtime configuration (via environment variables before fuse_main daemonizes):
+ *   HF_RO_FUSE_URLS       Tab-separated table: <rel_path>\t<size_bytes>\t<url>
+ *                         (default: /dev/shm/.maya_hf_urls)
+ *   HF_RO_FUSE_REFRESHER  Optional command executed on HTTP 401/403 (rate-limited to 5s)
+ *                         (default: /content/project-maya/maya_url_token_refresher.sh --hf-only)
+ */
+
+#define _GNU_SOURCE
+#define FUSE_USE_VERSION 31
+
+#include <curl/curl.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <fuse3/fuse.h>
+#include <limits.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+
+#define MAX_HF_FILES 16
+#define HF_URL_MAX 8192
+
+struct HfEntry {
+    char rel_path[512];
+    char dir_name[256];
+    char base_name[256];
+    uint64_t size;
+    char url[HF_URL_MAX];
+};
+
+struct HfWriteCtx {
+    unsigned char *dst;
+    size_t cap;
+    size_t got;
+    int overflow;
+};
+
+static char g_urls_path[PATH_MAX] = "/dev/shm/.maya_hf_urls";
+static char g_refresher_cmd[PATH_MAX] = "/content/project-maya/maya_url_token_refresher.sh --hf-only";
+
+static pthread_mutex_t g_tbl_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_refresh_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct HfEntry g_entries[MAX_HF_FILES];
+static int g_n_entries = 0;
+static struct timespec g_last_mtime;
+static uint64_t g_last_stat_ns = 0;
+static uint64_t g_last_refresh_ns = 0;
+
+static pthread_once_t g_curl_key_once = PTHREAD_ONCE_INIT;
+static pthread_key_t g_curl_key;
+
+static uint64_t mono_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static int parse_urls_file(const char *path, struct HfEntry *out, int *out_n, struct timespec *out_mtim) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+
+    struct stat st;
+    if (fstat(fileno(fp), &st) != 0) {
+        fclose(fp);
+        return -1;
+    }
+
+    int count = 0;
+    char line[16384];
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = '\0';
+        }
+        if (len == 0 || line[0] == '#') continue;
+
+        char *t1 = strchr(line, '\t');
+        if (!t1) continue;
+        char *t2 = strchr(t1 + 1, '\t');
+        if (!t2) continue;
+
+        *t1 = '\0';
+        *t2 = '\0';
+
+        const char *rel = line;
+        while (*rel == '/') rel++;
+        const char *sz_str = t1 + 1;
+        const char *url = t2 + 1;
+
+        if (!rel[0] || !sz_str[0] || !url[0]) continue;
+        if (strlen(rel) >= sizeof(out[0].rel_path)) continue;
+        if (strlen(url) >= sizeof(out[0].url)) continue;
+
+        char *endp = NULL;
+        errno = 0;
+        unsigned long long sz = strtoull(sz_str, &endp, 10);
+        if (errno != 0 || endp == sz_str || (endp && *endp != '\0') || sz == 0) continue;
+
+        if (count >= MAX_HF_FILES) break;
+        struct HfEntry *e = &out[count];
+        memset(e, 0, sizeof(*e));
+        snprintf(e->rel_path, sizeof(e->rel_path), "%s", rel);
+        e->size = (uint64_t)sz;
+        snprintf(e->url, sizeof(e->url), "%s", url);
+
+        const char *slash = strchr(rel, '/');
+        if (slash) {
+            size_t dlen = (size_t)(slash - rel);
+            if (dlen == 0 || dlen >= sizeof(e->dir_name) || strchr(slash + 1, '/') != NULL) continue;
+            memcpy(e->dir_name, rel, dlen);
+            e->dir_name[dlen] = '\0';
+            if (!slash[1] || strlen(slash + 1) >= sizeof(e->base_name)) continue;
+            snprintf(e->base_name, sizeof(e->base_name), "%s", slash + 1);
+        } else {
+            if (strlen(rel) >= sizeof(e->base_name)) continue;
+            e->dir_name[0] = '\0';
+            snprintf(e->base_name, sizeof(e->base_name), "%s", rel);
+        }
+        count++;
+    }
+    fclose(fp);
+
+    if (count <= 0) return -1;
+    *out_n = count;
+    if (out_mtim) *out_mtim = st.st_mtim;
+    return 0;
+}
+
+static int reload_urls_if_needed(int force_refresh) {
+    if (force_refresh && g_refresher_cmd[0]) {
+        pthread_mutex_lock(&g_refresh_lock);
+        uint64_t now = mono_ns();
+        if (now - g_last_refresh_ns >= 5000000000ULL) {
+            int rc = system(g_refresher_cmd);
+            (void)rc;
+            g_last_refresh_ns = mono_ns();
+        }
+        pthread_mutex_unlock(&g_refresh_lock);
+    }
+
+    uint64_t now = mono_ns();
+    pthread_mutex_lock(&g_tbl_lock);
+    int need_check = force_refresh || (g_n_entries == 0) || ((now - g_last_stat_ns) >= 2000000000ULL);
+    if (need_check) {
+        g_last_stat_ns = now;
+        struct stat st;
+        if (stat(g_urls_path, &st) == 0) {
+            int mtime_changed = (st.st_mtim.tv_sec != g_last_mtime.tv_sec ||
+                                 st.st_mtim.tv_nsec != g_last_mtime.tv_nsec);
+            if (force_refresh || g_n_entries == 0 || mtime_changed) {
+                struct HfEntry tmp[MAX_HF_FILES];
+                int tmp_n = 0;
+                struct timespec mt;
+                if (parse_urls_file(g_urls_path, tmp, &tmp_n, &mt) == 0) {
+                    memcpy(g_entries, tmp, (size_t)tmp_n * sizeof(tmp[0]));
+                    g_n_entries = tmp_n;
+                    g_last_mtime = mt;
+                }
+            }
+        }
+    }
+    int ok = (g_n_entries > 0);
+    pthread_mutex_unlock(&g_tbl_lock);
+    return ok ? 0 : -1;
+}
+
+static int lookup_file(const char *fuse_path, struct HfEntry *out) {
+    if (!fuse_path || fuse_path[0] != '/' || !fuse_path[1]) return -1;
+    const char *rel = fuse_path + 1;
+    (void)reload_urls_if_needed(0);
+    pthread_mutex_lock(&g_tbl_lock);
+    for (int i = 0; i < g_n_entries; i++) {
+        if (strcmp(g_entries[i].rel_path, rel) == 0) {
+            if (out) *out = g_entries[i];
+            pthread_mutex_unlock(&g_tbl_lock);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&g_tbl_lock);
+    return -1;
+}
+
+static int is_known_dir(const char *fuse_path) {
+    if (!fuse_path || fuse_path[0] != '/') return 0;
+    if (fuse_path[1] == '\0') return 1;
+    const char *dir = fuse_path + 1;
+    (void)reload_urls_if_needed(0);
+    pthread_mutex_lock(&g_tbl_lock);
+    for (int i = 0; i < g_n_entries; i++) {
+        if (g_entries[i].dir_name[0] && strcmp(g_entries[i].dir_name, dir) == 0) {
+            pthread_mutex_unlock(&g_tbl_lock);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&g_tbl_lock);
+    return 0;
+}
+
+static void destroy_tls_curl(void *ptr) {
+    CURL *eh = (CURL *)ptr;
+    if (eh) curl_easy_cleanup(eh);
+}
+
+static void make_curl_key(void) {
+    pthread_key_create(&g_curl_key, destroy_tls_curl);
+}
+
+static CURL *get_tls_curl(void) {
+    pthread_once(&g_curl_key_once, make_curl_key);
+    CURL *eh = (CURL *)pthread_getspecific(g_curl_key);
+    if (!eh) {
+        eh = curl_easy_init();
+        if (!eh) return NULL;
+        curl_easy_setopt(eh, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(eh, CURLOPT_TCP_NODELAY, 1L);
+        curl_easy_setopt(eh, CURLOPT_TCP_KEEPALIVE, 1L);
+        curl_easy_setopt(eh, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+        curl_easy_setopt(eh, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(eh, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
+        curl_easy_setopt(eh, CURLOPT_TIMEOUT_MS, 60000L);
+        curl_easy_setopt(eh, CURLOPT_BUFFERSIZE, 524288L);
+        curl_easy_setopt(eh, CURLOPT_HTTPHEADER, NULL);
+        if (pthread_setspecific(g_curl_key, eh) != 0) {
+            curl_easy_cleanup(eh);
+            return NULL;
+        }
+    }
+    return eh;
+}
+
+static size_t hf_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
+    size_t total = size * nmemb;
+    struct HfWriteCtx *ctx = (struct HfWriteCtx *)userdata;
+    if (total > ctx->cap - ctx->got) {
+        ctx->overflow = 1;
+        return 0;
+    }
+    memcpy(ctx->dst + ctx->got, ptr, total);
+    ctx->got += total;
+    return total;
+}
+
+static void *hf_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
+    (void)conn;
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    if (cfg) {
+        cfg->kernel_cache = 1;
+        cfg->attr_timeout = 3600.0;
+        cfg->entry_timeout = 3600.0;
+        cfg->negative_timeout = 60.0;
+    }
+    return NULL;
+}
+
+static int hf_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi) {
+    (void)fi;
+    memset(stbuf, 0, sizeof(*stbuf));
+
+    if (strcmp(path, "/") == 0) {
+        stbuf->st_mode = S_IFDIR | 0555;
+        stbuf->st_nlink = 3;
+        return 0;
+    }
+    if (is_known_dir(path)) {
+        stbuf->st_mode = S_IFDIR | 0555;
+        stbuf->st_nlink = 2;
+        return 0;
+    }
+
+    struct HfEntry ent;
+    if (lookup_file(path, &ent) == 0) {
+        stbuf->st_mode = S_IFREG | 0444;
+        stbuf->st_nlink = 1;
+        stbuf->st_size = (off_t)ent.size;
+        stbuf->st_blocks = (blkcnt_t)((ent.size + 511ULL) / 512ULL);
+        return 0;
+    }
+    return -ENOENT;
+}
+
+static int hf_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
+                      off_t offset, struct fuse_file_info *fi,
+                      enum fuse_readdir_flags flags) {
+    (void)offset;
+    (void)fi;
+    (void)flags;
+
+    if (strcmp(path, "/") != 0 && !is_known_dir(path)) return -ENOENT;
+
+    (void)reload_urls_if_needed(0);
+    filler(buf, ".", NULL, 0, (enum fuse_fill_dir_flags)0);
+    filler(buf, "..", NULL, 0, (enum fuse_fill_dir_flags)0);
+
+    pthread_mutex_lock(&g_tbl_lock);
+    if (strcmp(path, "/") == 0) {
+        char seen_dirs[MAX_HF_FILES][256];
+        int n_seen = 0;
+        for (int i = 0; i < g_n_entries; i++) {
+            if (g_entries[i].dir_name[0]) {
+                int dup = 0;
+                for (int j = 0; j < n_seen; j++) {
+                    if (strcmp(seen_dirs[j], g_entries[i].dir_name) == 0) {
+                        dup = 1;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    snprintf(seen_dirs[n_seen++], sizeof(seen_dirs[0]), "%s", g_entries[i].dir_name);
+                    filler(buf, g_entries[i].dir_name, NULL, 0, (enum fuse_fill_dir_flags)0);
+                }
+            } else {
+                filler(buf, g_entries[i].base_name, NULL, 0, (enum fuse_fill_dir_flags)0);
+            }
+        }
+    } else {
+        const char *dir = path + 1;
+        for (int i = 0; i < g_n_entries; i++) {
+            if (strcmp(g_entries[i].dir_name, dir) == 0) {
+                filler(buf, g_entries[i].base_name, NULL, 0, (enum fuse_fill_dir_flags)0);
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_tbl_lock);
+    return 0;
+}
+
+static int hf_open(const char *path, struct fuse_file_info *fi) {
+    if ((fi->flags & O_ACCMODE) != O_RDONLY) return -EROFS;
+    if (lookup_file(path, NULL) != 0) return -ENOENT;
+    fi->keep_cache = 1;
+    return 0;
+}
+
+static int hf_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
+    (void)fi;
+    if (offset < 0) return -EINVAL;
+
+    struct HfEntry ent;
+    if (lookup_file(path, &ent) != 0) return -ENOENT;
+    if ((uint64_t)offset >= ent.size) return 0;
+
+    size_t want = size;
+    uint64_t remain = ent.size - (uint64_t)offset;
+    if ((uint64_t)want > remain) want = (size_t)remain;
+    if (want > (size_t)INT_MAX) want = (size_t)INT_MAX;
+    if (want == 0) return 0;
+
+    CURL *eh = get_tls_curl();
+    if (!eh) return -EIO;
+
+    char range[64];
+    snprintf(range, sizeof(range), "%llu-%llu",
+             (unsigned long long)offset,
+             (unsigned long long)((uint64_t)offset + (uint64_t)want - 1ULL));
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+        struct HfWriteCtx ctx;
+        ctx.dst = (unsigned char *)buf;
+        ctx.cap = want;
+        ctx.got = 0;
+        ctx.overflow = 0;
+
+        curl_easy_setopt(eh, CURLOPT_URL, ent.url);
+        curl_easy_setopt(eh, CURLOPT_RANGE, range);
+        curl_easy_setopt(eh, CURLOPT_WRITEFUNCTION, hf_write_cb);
+        curl_easy_setopt(eh, CURLOPT_WRITEDATA, &ctx);
+
+        CURLcode res = curl_easy_perform(eh);
+        long code = 0;
+        if (res == CURLE_OK) {
+            curl_easy_getinfo(eh, CURLINFO_RESPONSE_CODE, &code);
+        }
+        if (res == CURLE_OK && code == 206 && !ctx.overflow && ctx.got == want) {
+            return (int)want;
+        }
+        int force = (res == CURLE_OK && (code == 401 || code == 403));
+        (void)reload_urls_if_needed(force);
+        (void)lookup_file(path, &ent);
+    }
+    return -EIO;
+}
+
+static const struct fuse_operations hf_oper = {
+    .init    = hf_init,
+    .getattr = hf_getattr,
+    .readdir = hf_readdir,
+    .open    = hf_open,
+    .read    = hf_read,
+};
+
+int main(int argc, char *argv[]) {
+    const char *env_urls = getenv("HF_RO_FUSE_URLS");
+    if (env_urls && env_urls[0]) {
+        snprintf(g_urls_path, sizeof(g_urls_path), "%s", env_urls);
+    }
+    const char *env_ref = getenv("HF_RO_FUSE_REFRESHER");
+    if (env_ref) {
+        snprintf(g_refresher_cmd, sizeof(g_refresher_cmd), "%s", env_ref);
+    }
+
+    if (reload_urls_if_needed(0) != 0) {
+        fprintf(stderr, "hf_ro_fuse: failed to load URLs from %s\n", g_urls_path);
+        return 1;
+    }
+
+    return fuse_main(argc, argv, &hf_oper, NULL);
+}
+HCEOF
+}
+
+SHARDS57_SOURCE="${MAYA_SHARDS57_SOURCE:-auto}"
+if [ "$SHARDS57_SOURCE" = "auto" ]; then
+  if [ -n "${HF_TOKEN:-}" ]; then
+    SHARDS57_SOURCE="hf"
+  elif [ -f /tmp/gcs-key.json ] && [ -n "$GCS_BUCKET" ]; then
+    SHARDS57_SOURCE="gcs"
+  else
+    SHARDS57_SOURCE="shm"
+  fi
+fi
+
+REMOTE_MOUNT_DIR=""
+GCS_MOUNT_DIR=""
+USE_HF_FUSE=0
+PREFER_GCS_DOWNLOAD="0"
+S2_GCS_DISABLE=""
+
 if [ "$SCRATCH_FREE_GB" -ge 200 ]; then
   echo "[模式 A: A100 双盘均衡模式 (检测到 /mnt/local-scratch 可用 ${SCRATCH_FREE_GB}G)]"
   echo "  -> 将 Shard 00001/00002/00003 (~183 GiB) 存入 /mnt/local-scratch/maya-shards 并软链，释放 / 与全部 167 GiB 系统内存！"
@@ -38,7 +612,7 @@ if [ "$SCRATCH_FREE_GB" -ge 200 ]; then
     export HF_TOKEN="$(cat /root/.cache/huggingface/token)"
   fi
   export HF_HOME="/mnt/local-scratch/hf-cache"
-  GCS_MOUNT_DIR=""
+  S2_DIR=""
   PREFILL_CHUNK="16384"
   RAM_MARGIN="6.0"
   DISK_SKIP_W="0"
@@ -54,17 +628,81 @@ if [ "$SCRATCH_FREE_GB" -ge 200 ]; then
   S2_GCS_THRESH=""
   INDEX_TC=""
   CPU_PREPARE_ROWS="1"
+elif [ "$SHARDS57_SOURCE" = "hf" ] && [ -n "${HF_TOKEN:-}" ]; then
+  echo "[模式 B1: G4 零冷启 GCS 流量 (HF FUSE /mnt/hf + HTTP/2 直连加速)]"
+  echo "  -> Shards 1-4、dspark、vision 通过 Hugging Face Xet 免费高速拉取至本地 NVMe (\$0.00/GB)；"
+  echo "     Shards 5-7 (~131 GiB) 挂载只读 FUSE3 /mnt/hf 并经由 HTTP/2 Range 直连旁路读取 us.gcp.cdn.hf.co (\$0.00/GB)；"
+  if [ -f /tmp/gcs-key.json ] && [ -n "$GCS_BUCKET" ]; then
+    echo "     Shard 00002 保持双模态门控 (Decode <=160 走本地 NVMe / 长文本 Prefill >160 溢流至 8×8 HTTP/2 GCS Pool)。"
+  else
+    echo "     未提供 GCS 凭据，Shard 00002 纯走本地 NVMe，仍实现 100% RAM/VRAM 常驻 (disk_gb=0.0)。"
+  fi
+  if ! command -v fusermount3 >/dev/null 2>&1 || ! command -v gcc >/dev/null 2>&1 || ! command -v pkg-config >/dev/null 2>&1 || \
+     [ ! -f /usr/include/fuse3/fuse.h ] || { [ ! -f /usr/include/x86_64-linux-gnu/curl/curl.h ] && [ ! -f /usr/include/curl/curl.h ]; }; then
+    echo "  -> 安装 fuse3 libfuse3-dev libcurl4-openssl-dev pkg-config..."
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq fuse3 libfuse3-dev libcurl4-openssl-dev pkg-config
+  fi
+  write_refresher_script
+  "$WORK_DIR/maya_url_token_refresher.sh" --once || true
+  "$WORK_DIR/maya_url_token_refresher.sh" --hf-only
+  if ! pgrep -f "maya_url_token_refresher.sh" >/dev/null 2>&1; then
+    nohup "$WORK_DIR/maya_url_token_refresher.sh" >/dev/null 2>&1 < /dev/null &
+  fi
+  [ -f /tmp/hf_ro_fuse.c ] || write_hf_ro_fuse_c
+  gcc -Wall -Wextra -Werror -O2 /tmp/hf_ro_fuse.c -o "$WORK_DIR/hf_ro_fuse.tmp" $(pkg-config --cflags --libs fuse3 libcurl) -lpthread
+  mv -f "$WORK_DIR/hf_ro_fuse.tmp" "$WORK_DIR/hf_ro_fuse"
+  mkdir -p /mnt/hf
+  if mountpoint -q /mnt/hf 2>/dev/null && timeout 10 ls /mnt/hf/Mix-256G >/dev/null 2>&1; then
+    echo "  -> /mnt/hf 已处于健康挂载状态，复用现有 hf_ro_fuse。"
+  else
+    fusermount3 -u /mnt/hf 2>/dev/null || umount -l /mnt/hf 2>/dev/null || true
+    HF_RO_FUSE_URLS="/dev/shm/.maya_hf_urls" \
+    HF_RO_FUSE_REFRESHER="$WORK_DIR/maya_url_token_refresher.sh --hf-only" \
+      "$WORK_DIR/hf_ro_fuse" -o ro /mnt/hf
+    sleep 0.5
+    timeout 10 ls /mnt/hf/Mix-256G >/dev/null
+  fi
+  SCRATCH_SHARDS_DIR=""
+  S2_DIR=""
+  USE_HF_FUSE=1
+  REMOTE_MOUNT_DIR="/mnt/hf"
+  GCS_MOUNT_DIR=""
+  PREFER_GCS_DOWNLOAD="${MAYA_PREFER_GCS_DOWNLOAD:-0}"
+  PREFILL_CHUNK="32768"
+  RAM_MARGIN="6.0"
+  DISK_SKIP_W="0"
+  PROMPT_PICK=""
+  ENGRAM_CACHE_MB="4096"
+  LENT_RAM_GB="7.5"
+  FLOW_COPY_DMA="1"
+  YOCO_CONE="1"
+  EG_RANDOM="1"
+  RESTORE_TAIL="0"
+  INDEX_TC="1"
+  CPU_PREPARE_ROWS="1"
+  if [ -f /tmp/gcs-key.json ] && [ -n "$GCS_BUCKET" ]; then
+    ENGRAM_THREADS="768"
+    S2_LOCAL_MAX="16"
+    S2_GCS_THRESH="160"
+    S2_GCS_DISABLE=""
+  else
+    ENGRAM_THREADS=""
+    S2_LOCAL_MAX=""
+    S2_GCS_THRESH=""
+    S2_GCS_DISABLE="1"
+  fi
 elif [ -f /tmp/gcs-key.json ] && [ -n "$GCS_BUCKET" ]; then
-  echo "[模式 B1: G4 + GCS 全量内存 + HTTP/2 直连加速模式]"
+  echo "[模式 B1-GCS: G4 + gcsfuse 全量内存 + HTTP/2 直连加速模式 (兼容回退)]"
   echo "  -> Shard 00002 (110.6 GiB Engram 随机行表) 放本地 NVMe；"
   echo "     Shard 00005/6/7 (~141 GiB 专家权重) 挂载 /mnt/gcs 并经由 >256KB HTTP/2 Range 直连旁路读取；"
   echo "     热运行时 Shard 00002 经 mincore -> 双模态门控 (Decode 纯走本地 NVMe / 768 线程 Prefill 溢流至 8×8 HTTP/2 50Gbps GCS Pool)。"
   if ! command -v gcsfuse >/dev/null 2>&1; then
     apt-get update -qq
-    apt-get install -y -qq gnupg lsb-release curl fuse3
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gnupg lsb-release curl fuse3
     curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor --yes -o /usr/share/keyrings/cloud.google.gpg
     echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt gcsfuse-$(lsb_release -cs) main" > /etc/apt/sources.list.d/gcsfuse.list
-    apt-get update -qq && apt-get install -y -qq gcsfuse
+    apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gcsfuse
   fi
   mkdir -p /mnt/gcs
   if mountpoint -q /mnt/gcs 2>/dev/null && timeout 10 ls /mnt/gcs/Mix-256G >/dev/null 2>&1; then
@@ -82,7 +720,9 @@ elif [ -f /tmp/gcs-key.json ] && [ -n "$GCS_BUCKET" ]; then
   fi
   SCRATCH_SHARDS_DIR=""
   S2_DIR=""
+  REMOTE_MOUNT_DIR="/mnt/gcs"
   GCS_MOUNT_DIR="/mnt/gcs"
+  PREFER_GCS_DOWNLOAD="${MAYA_PREFER_GCS_DOWNLOAD:-1}"
   PREFILL_CHUNK="32768"
   RAM_MARGIN="6.0"
   DISK_SKIP_W="0"
@@ -98,13 +738,13 @@ elif [ -f /tmp/gcs-key.json ] && [ -n "$GCS_BUCKET" ]; then
   S2_GCS_THRESH="160"
   INDEX_TC="1"
   CPU_PREPARE_ROWS="1"
+  S2_GCS_DISABLE=""
 else
-  echo "[模式 B2: 单盘 + /dev/shm 模式 (G4 236G 单盘)]"
+  echo "[模式 B2: 单盘 + /dev/shm 模式 (G4 236G 无凭据兜底)]"
   echo "  -> 扩容 /dev/shm 至 110G 存放 Shard 00002 (103GiB Engram表)..."
   mount -o remount,size=110G /dev/shm
   SCRATCH_SHARDS_DIR=""
   S2_DIR="/dev/shm"
-  GCS_MOUNT_DIR=""
   PREFILL_CHUNK="16384"
   RAM_MARGIN="8.0"
   DISK_SKIP_W="1.01"
@@ -172,18 +812,18 @@ if [ ! -x /usr/local/bin/cloudflared ]; then
 fi
 
 echo "[3/6] 准备 Python 运行环境 (.venv)..."
-if ! "$WORK_DIR/.venv/bin/python" -c "import huggingface_hub, hf_transfer, tokenizers, aiohttp, numpy, jinja2, regex, PIL, psutil, yaml, tqdm, requests, jsonschema, pynvml" 2>/dev/null; then
+if ! "$WORK_DIR/.venv/bin/python" -c "import huggingface_hub, hf_xet, tokenizers, aiohttp, numpy, jinja2, regex, PIL, psutil, yaml, tqdm, requests, jsonschema, pynvml" 2>/dev/null; then
   rm -rf "$WORK_DIR/.venv"
-  if python3 -c "import huggingface_hub, hf_transfer, tokenizers, aiohttp, numpy, jinja2, regex, PIL, psutil, yaml, tqdm, requests, jsonschema, pynvml" 2>/dev/null; then
+  if python3 -c "import huggingface_hub, hf_xet, tokenizers, aiohttp, numpy, jinja2, regex, PIL, psutil, yaml, tqdm, requests, jsonschema, pynvml" 2>/dev/null; then
     mkdir -p "$WORK_DIR/.venv/bin"
     ln -sf "$(command -v python3)" "$WORK_DIR/.venv/bin/python"
     ln -sf "$(command -v python3)" "$WORK_DIR/.venv/bin/python3"
   elif command -v uv >/dev/null 2>&1; then
     uv venv "$WORK_DIR/.venv"
-    uv pip install --python "$WORK_DIR/.venv/bin/python" huggingface_hub hf_transfer tokenizers aiohttp numpy jinja2 regex pillow psutil pyyaml tqdm requests "jsonschema>=4.18,<5" nvidia-ml-py
+    uv pip install --python "$WORK_DIR/.venv/bin/python" huggingface_hub hf-xet hf_transfer tokenizers aiohttp numpy jinja2 regex pillow psutil pyyaml tqdm requests "jsonschema>=4.18,<5" nvidia-ml-py
   else
     python3 -m venv "$WORK_DIR/.venv"
-    "$WORK_DIR/.venv/bin/pip" install -q -U pip huggingface_hub hf_transfer tokenizers aiohttp numpy jinja2 regex pillow psutil pyyaml tqdm requests "jsonschema>=4.18,<5" nvidia-ml-py
+    "$WORK_DIR/.venv/bin/pip" install -q -U pip huggingface_hub hf-xet hf_transfer tokenizers aiohttp numpy jinja2 regex pillow psutil pyyaml tqdm requests "jsonschema>=4.18,<5" nvidia-ml-py
   fi
 fi
 
@@ -200,7 +840,9 @@ if [ ! -d "$WORK_DIR/tools/ds4" ] || [ ! -f "$WORK_DIR/tools/maya_import.py" ] |
   rm -rf /tmp/pm-tools
 fi
 export HF_HUB_ENABLE_HF_TRANSFER=1
-export SCRATCH_SHARDS_DIR S2_DIR GCS_MOUNT_DIR GCS_BUCKET
+export HF_XET_HIGH_PERFORMANCE=1
+export HF_XET_CACHE=/tmp/hf-xet-cache
+export SCRATCH_SHARDS_DIR S2_DIR REMOTE_MOUNT_DIR GCS_MOUNT_DIR PREFER_GCS_DOWNLOAD GCS_BUCKET
 
 "$WORK_DIR/.venv/bin/python" - << 'PY'
 import os, shutil, subprocess, sys, types
@@ -210,7 +852,9 @@ from huggingface_hub import hf_hub_download
 repo = "orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF"
 model_root = "/content/maya-models/DeepSeek-V4.1-Flash-1017-abliterated-GGUF"
 scratch_shards_dir = os.environ.get("SCRATCH_SHARDS_DIR", "")
+remote_mount_dir = os.environ.get("REMOTE_MOUNT_DIR", "")
 gcs_mount_dir = os.environ.get("GCS_MOUNT_DIR", "")
+prefer_gcs = os.environ.get("PREFER_GCS_DOWNLOAD", "0") == "1"
 gcs_bucket = os.environ.get("GCS_BUCKET", "").strip()
 if not gcs_bucket and os.path.isfile("/tmp/gcs-bucket"):
     gcs_bucket = open("/tmp/gcs-bucket").read().strip()
@@ -220,13 +864,9 @@ s2_dir = os.environ.get("S2_DIR", "/dev/shm")
 token = os.environ.get("HF_TOKEN") or None
 
 def pull_from_gcs(rel_path, dest_path):
-    if not (gcs_mount_dir and gcs_bucket and os.path.isfile(gcs_key_file) and gcloud_bin):
+    if not (gcs_bucket and os.path.isfile(gcs_key_file) and gcloud_bin):
         return False
-    gcs_src = os.path.join(gcs_mount_dir, rel_path)
-    if not os.path.isfile(gcs_src):
-        return False
-    exp_sz = os.path.getsize(gcs_src)
-    if os.path.isfile(dest_path) and not os.path.islink(dest_path) and os.path.getsize(dest_path) == exp_sz:
+    if os.path.isfile(dest_path) and not os.path.islink(dest_path) and os.path.getsize(dest_path) > 0:
         return True
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
     if os.path.lexists(dest_path):
@@ -234,11 +874,11 @@ def pull_from_gcs(rel_path, dest_path):
     tmp_dl = dest_path + ".gcs-part"
     if os.path.lexists(tmp_dl):
         os.remove(tmp_dl)
-    print(f"Downloading {rel_path} from GCS to local NVMe ({exp_sz / (1024**3):.2f} GiB)...", flush=True)
+    print(f"Downloading {rel_path} from GCS to local NVMe...", flush=True)
     env = os.environ.copy()
     env["CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE"] = gcs_key_file
     rc = subprocess.run([gcloud_bin, "storage", "cp", f"gs://{gcs_bucket}/{rel_path}", tmp_dl], env=env).returncode
-    if rc == 0 and os.path.isfile(tmp_dl) and os.path.getsize(tmp_dl) == exp_sz:
+    if rc == 0 and os.path.isfile(tmp_dl) and os.path.getsize(tmp_dl) > 0:
         os.replace(tmp_dl, dest_path)
         return True
     if os.path.lexists(tmp_dl):
@@ -268,15 +908,17 @@ if scratch_shards_dir:
         os.symlink(target, link_path)
     for f in ssd_files:
         target = os.path.join(model_root, f)
+        if os.path.islink(target):
+            os.remove(target)
         if not os.path.exists(target):
             print(f"Downloading {f} to local SSD...")
             hf_hub_download(repo_id=repo, filename=f, local_dir=model_root, token=token)
-elif gcs_mount_dir:
+elif remote_mount_dir:
     # Shard 00002 is the two Engram embed tables (55.3 GiB each, 144 B rows read at
-    # random) - it MUST be local: gcsfuse serves ~17 random rows/s, local NVMe ~22 000.
+    # random) - it MUST be local: remote FUSE serves ~17 random rows/s, local NVMe ~22 000.
     # Shards 5/6/7 are expert weights read as large blocks while loading, then RAM resident,
-    # so they are the safe ones to leave on the network mount.
-    gcs_files = [
+    # so they are safe on /mnt/hf (free HF CDN) or /mnt/gcs (legacy).
+    remote_files = [
         f"Mix-256G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-0000{i}-of-00007.gguf"
         for i in [5, 6, 7]
     ]
@@ -284,20 +926,33 @@ elif gcs_mount_dir:
         f"Mix-256G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-0000{i}-of-00007.gguf"
         for i in [1, 2, 3, 4]
     ]
-    for f in gcs_files:
-        gcs_path = os.path.join(gcs_mount_dir, f)
-        assert os.path.exists(gcs_path), f"Missing {gcs_path} in GCS mount!"
+    for f in remote_files:
+        rem_path = os.path.join(remote_mount_dir, f)
+        assert os.path.exists(rem_path), f"Missing {rem_path} in mount {remote_mount_dir}!"
         link_path = os.path.join(model_root, f)
         if os.path.lexists(link_path):
             os.remove(link_path)
-        os.symlink(gcs_path, link_path)
-        print(f"Symlinked {f} -> {gcs_path}")
+        os.symlink(rem_path, link_path)
+        print(f"Symlinked {f} -> {rem_path}")
     for f in ssd_files:
         target = os.path.join(model_root, f)
-        if not pull_from_gcs(f, target):
-            if not os.path.exists(target):
-                print(f"Downloading {f} to local SSD via HF...")
+        if os.path.islink(target):
+            os.remove(target)
+        if os.path.isfile(target) and os.path.getsize(target) > 0:
+            continue
+        got = False
+        if prefer_gcs:
+            got = pull_from_gcs(f, target)
+        if not got:
+            print(f"Downloading {f} to local SSD via HF (free Xet/CDN)...", flush=True)
+            try:
                 hf_hub_download(repo_id=repo, filename=f, local_dir=model_root, token=token)
+                got = os.path.isfile(target) and os.path.getsize(target) > 0
+            except Exception as exc:
+                print(f"HF download failed for {f}: {exc}", flush=True)
+        if not got and not prefer_gcs:
+            got = pull_from_gcs(f, target)
+        assert got and os.path.isfile(target), f"Failed to download {f}"
 else:
     s2_name = "Mix-256G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-00002-of-00007.gguf"
     s2_target = os.path.join(s2_dir, os.path.basename(s2_name))
@@ -319,13 +974,15 @@ else:
     ]
     for f in files:
         target = os.path.join(model_root, f)
+        if os.path.islink(target):
+            os.remove(target)
         if not os.path.exists(target):
             print(f"Downloading {f} to local SSD...")
             hf_hub_download(repo_id=repo, filename=f, local_dir=model_root, token=token)
 
 dspark_dir = Path(model_root) / "dspark"
 dspark_dir.mkdir(parents=True, exist_ok=True)
-if gcs_mount_dir:
+if prefer_gcs:
     for rel in ("dspark/dspark.bin", "dspark/dspark.json"):
         pull_from_gcs(rel, os.path.join(model_root, rel))
 if not ((dspark_dir / "dspark.bin").is_file() and (dspark_dir / "dspark.json").is_file()):
@@ -344,12 +1001,13 @@ if not ((dspark_dir / "dspark.bin").is_file() and (dspark_dir / "dspark.json").i
 
 vision_dir = Path(model_root) / "vision"
 vision_dir.mkdir(parents=True, exist_ok=True)
-if gcs_mount_dir:
+if prefer_gcs:
     for rel in ("vision/vision.bin", "vision/vision.json"):
         pull_from_gcs(rel, os.path.join(model_root, rel))
 if not ((vision_dir / "vision.bin").is_file() and (vision_dir / "vision.json").is_file()):
     print("Preparing vision/vision.bin from BF16 mmproj...")
-    mmproj_tmp = Path("/tmp/mmproj")
+    shm_free = shutil.disk_usage("/dev/shm").free if os.path.isdir("/dev/shm") else 0
+    mmproj_tmp = Path("/dev/shm/mmproj" if shm_free >= 3 * 1024**3 else "/tmp/mmproj")
     mmproj_tmp.mkdir(parents=True, exist_ok=True)
     mmproj_path = hf_hub_download(
         repo_id=repo,
@@ -364,7 +1022,7 @@ if not ((vision_dir / "vision.bin").is_file() and (vision_dir / "vision.json").i
     shutil.rmtree(mmproj_tmp, ignore_errors=True)
 PY
 
-rm -rf "$MODEL_ROOT/.cache" "${SCRATCH_SHARDS_DIR:-/tmp/nonexistent}/.cache" 2>/dev/null || true
+rm -rf "$MODEL_ROOT/.cache" "${SCRATCH_SHARDS_DIR:-/tmp/nonexistent}/.cache" /tmp/hf-xet-cache 2>/dev/null || true
 
 echo "[5/6] 恢复预打包索引与写入自适应配置..."
 if [ -f "$WORK_DIR/pack-meta-256g.tar.gz" ]; then
@@ -377,7 +1035,7 @@ if ! echo "$GPU_NAME" | grep -qi "Blackwell"; then
   rm -f "$MODEL_ROOT/Mix-256G/maya-ds4/lane-times.txt"
 fi
 
-export PREFILL_CHUNK RAM_MARGIN DISK_SKIP_W PROMPT_PICK ENGRAM_CACHE_MB LENT_RAM_GB FLOW_COPY_DMA ENGRAM_THREADS YOCO_CONE EG_RANDOM RESTORE_TAIL S2_LOCAL_MAX S2_GCS_THRESH INDEX_TC CPU_PREPARE_ROWS
+export PREFILL_CHUNK RAM_MARGIN DISK_SKIP_W PROMPT_PICK ENGRAM_CACHE_MB LENT_RAM_GB FLOW_COPY_DMA ENGRAM_THREADS YOCO_CONE EG_RANDOM RESTORE_TAIL S2_LOCAL_MAX S2_GCS_THRESH S2_GCS_DISABLE INDEX_TC CPU_PREPARE_ROWS
 "$WORK_DIR/.venv/bin/python" - << 'PY'
 import json, os
 cfg_path = "/content/project-maya/maya-ds4.json"
@@ -413,6 +1071,7 @@ opt_map = {
     "RESTORE_TAIL": "MAYA_DS4_RESTORE_TAIL",
     "S2_LOCAL_MAX": "MAYA_S2_LOCAL_MAX",
     "S2_GCS_THRESH": "MAYA_S2_GCS_THRESH",
+    "S2_GCS_DISABLE": "MAYA_S2_GCS_DISABLE",
     "INDEX_TC": "DS4_INDEX_TC",
     "CPU_PREPARE_ROWS": "DS4_CPU_PREPARE_ROWS",
 }
@@ -460,43 +1119,46 @@ for ent in os.listdir("/proc"):
 PY
 
 PRELOAD_ENV=""
-if [ -n "${GCS_MOUNT_DIR:-}" ]; then
-  if [ ! -f /usr/include/x86_64-linux-gnu/curl/curl.h ] && [ ! -f /usr/include/curl/curl.h ]; then
-    echo "  -> 安装 libcurl4-openssl-dev (用于 HTTP/2 直连 GCS)..."
-    apt-get update -qq && apt-get install -y -qq libcurl4-openssl-dev
+if [ -n "${REMOTE_MOUNT_DIR:-}" ]; then
+  if ! command -v gcc >/dev/null 2>&1 || { [ ! -f /usr/include/x86_64-linux-gnu/curl/curl.h ] && [ ! -f /usr/include/curl/curl.h ]; }; then
+    echo "  -> 安装 libcurl4-openssl-dev (用于 HTTP/2 直连旁路)..."
+    apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gcc libcurl4-openssl-dev
   fi
-  cat > "$WORK_DIR/maya_gcs_token_refresher.sh" << 'TEOF'
-#!/usr/bin/env bash
-set -u
-GCLOUD_BIN="/tools/google-cloud-sdk/bin/gcloud"
-[ -x "$GCLOUD_BIN" ] || GCLOUD_BIN="$(command -v gcloud || true)"
-refresh_once() {
-  [ -n "$GCLOUD_BIN" ] && [ -f /tmp/gcs-key.json ] || return 1
-  local tok
-  tok="$(CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=/tmp/gcs-key.json "$GCLOUD_BIN" auth print-access-token 2>/dev/null | tr -d '[:space:]')"
-  [ -n "$tok" ] || return 1
-  local tmp="/dev/shm/.maya_gcs_token.tmp.$$"
-  umask 077
-  printf '%s\n' "$tok" > "$tmp"
-  chmod 600 "$tmp"
-  mv -f "$tmp" /dev/shm/.maya_gcs_token
-}
-if [ "${1:-}" = "--once" ]; then
-  refresh_once
-  exit $?
-fi
-while true; do
-  refresh_once || true
-  sleep 1500
-done
-TEOF
-  chmod 700 "$WORK_DIR/maya_gcs_token_refresher.sh"
-  "$WORK_DIR/maya_gcs_token_refresher.sh" --once || true
-  if ! pgrep -f "maya_gcs_token_refresher.sh" >/dev/null 2>&1; then
-    nohup "$WORK_DIR/maya_gcs_token_refresher.sh" >/dev/null 2>&1 < /dev/null &
+  write_refresher_script
+  "$WORK_DIR/maya_url_token_refresher.sh" --once || true
+  if ! pgrep -f "maya_url_token_refresher.sh" >/dev/null 2>&1; then
+    nohup "$WORK_DIR/maya_url_token_refresher.sh" >/dev/null 2>&1 < /dev/null &
   fi
-  echo "  -> 编译 gcs_tls_pread.so (mincore 页缓存 + Decode/Prefill 双模态 GCS 8×8 HTTP/2 加速与 FUSE >256KB 直连旁路)..."
-  cat > /tmp/gcs_tls_pread.c << 'CEOF'
+  echo "  -> 编译 gcs_tls_pread.so (FUSE >256KB HF/GCS HTTP/2 直连旁路 + Shard 00002 mincore 双模态门控)..."
+  if [ ! -f /tmp/gcs_tls_pread.c ]; then
+    cat > /tmp/gcs_tls_pread.c << 'CEOF'
+/*
+ * gcs_tls_pread.c — LD_PRELOAD dual-regime GCS + NVMe I/O accelerator for Project Maya (maya-ds4)
+ *
+ * Build on Linux (Google Colab x86_64):
+ *   gcc -Wall -Wextra -Werror -shared -fPIC -O2 -U_FORTIFY_SOURCE \
+ *       src/gcs_tls_pread.c -o gcs_tls_pread.so -lcurl -ldl -lpthread
+ *
+ * Architecture:
+ *   1. FUSE > 256 KB Direct HTTPS HTTP/2 Range Bypass (`fuse_direct_pread64`) +
+ *      2 MB per-thread TLS metadata windows: eliminates gcsfuse's ~5.1x cold-load
+ *      read amplification (~645 GB -> ~145 GB), cutting cold GCS load from ~49 min
+ *      down to ~11.6-12.5 min.
+ *   2. Shard 00002 (110.6 GiB Engram random-lookup table) 3-Tier Accelerator (`s2_pread64`):
+ *      - Tier 1: Zero-syscall OS Page Cache hit via mincore() + memcpy() on MAP_SHARED mmap.
+ *      - Tier 2 (MAYA_S2_GCS_THRESH=160): Decode & short-prompt gate keeps tot <= 160
+ *        100% on local NVMe (0 network RTT stragglers, full OS Page Cache population).
+ *      - Tier 3 (MAYA_S2_LOCAL_MAX=16 + 8x8 HTTP/2 curl_multi pool): Prefill bursts
+ *        (DS4_ENGRAM_THREADS=768, tot > 160) cap local NVMe at QD=16 (~1,860 IOPS sweet spot)
+ *        and spill overflow across 64 multiplexed TLS HTTP/2 streams on 50 Gbps gVNIC,
+ *        with lossless real_pread64() fallback on timeout or gateway reconnect.
+ *
+ * Auth / Config Files Read at Runtime:
+ *   - /dev/shm/.maya_hf_urls      (chmod 600 presigned HF CDN URL table: <rel_path>\t<size>\t<url>)
+ *   - /tmp/gcs-bucket             (single line GCS bucket name)
+ *   - /dev/shm/.maya_gcs_token    (chmod 600 OAuth2 access token refreshed by background daemon)
+ */
+
 #define _GNU_SOURCE
 #include <curl/curl.h>
 #include <dlfcn.h>
@@ -532,6 +1194,12 @@ TEOF
 #define H2_MAX_FREE_HANDLES 160
 #define TOKEN_PATH "/dev/shm/.maya_gcs_token"
 #define BUCKET_PATH "/tmp/gcs-bucket"
+#define HF_DEFAULT_MOUNT_PREFIX "/mnt/hf/"
+#define HF_DEFAULT_URLS_PATH "/dev/shm/.maya_hf_urls"
+#define HF_DEFAULT_REFRESHER "/content/project-maya/maya_url_token_refresher.sh --hf-only"
+#define MAX_HF_DIRECT 16
+#define HF_URL_MAX 8192
+#define HF_URLS_BUF_MAX (256 * 1024)
 #define S2_OBJ_REL "Mix-256G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-00002-of-00007.gguf"
 #define S2_SUFFIX "-00002-of-00007.gguf"
 
@@ -569,6 +1237,24 @@ static char g_gcs_url[1024];
 static char g_tok_hdr[2304];
 static uint64_t g_tok_ver = 0;
 static uint64_t g_tok_last_ns = 0;
+
+struct HfDirectEntry {
+    char rel_path[512];
+    uint64_t size;
+    char url[HF_URL_MAX];
+};
+
+static char g_hf_mount_prefix[PATH_MAX] = HF_DEFAULT_MOUNT_PREFIX;
+static size_t g_hf_mount_prefix_len = 8;
+static char g_hf_urls_path[PATH_MAX] = HF_DEFAULT_URLS_PATH;
+static char g_hf_refresher_cmd[PATH_MAX] = HF_DEFAULT_REFRESHER;
+static pthread_mutex_t g_hf_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_hf_refresh_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct HfDirectEntry g_hf_entries[MAX_HF_DIRECT];
+static int g_hf_n_entries = 0;
+static struct timespec g_hf_last_mtime;
+static uint64_t g_hf_last_stat_ns = 0;
+static uint64_t g_hf_last_refresh_ns = 0;
 
 static uint64_t g_stat_pc = 0;
 static uint64_t g_stat_local = 0;
@@ -677,6 +1363,24 @@ static void init_syms(void) {
     if (fdd && atoi(fdd) != 0) g_fuse_direct_disable = 1;
     const char *dbg = getenv("MAYA_S2_DEBUG");
     if (dbg && atoi(dbg) != 0) g_s2_debug = 1;
+    const char *hf_pref = getenv("MAYA_HF_MOUNT_PREFIX");
+    if (hf_pref && hf_pref[0]) {
+        snprintf(g_hf_mount_prefix, sizeof(g_hf_mount_prefix), "%s", hf_pref);
+        size_t plen = strlen(g_hf_mount_prefix);
+        if (plen > 0 && g_hf_mount_prefix[plen - 1] != '/' && plen + 1 < sizeof(g_hf_mount_prefix)) {
+            g_hf_mount_prefix[plen++] = '/';
+            g_hf_mount_prefix[plen] = '\0';
+        }
+        g_hf_mount_prefix_len = plen;
+    }
+    const char *hf_urls = getenv("MAYA_HF_URLS_PATH");
+    if (hf_urls && hf_urls[0]) {
+        snprintf(g_hf_urls_path, sizeof(g_hf_urls_path), "%s", hf_urls);
+    }
+    const char *hf_ref = getenv("MAYA_HF_REFRESHER");
+    if (hf_ref) {
+        snprintf(g_hf_refresher_cmd, sizeof(g_hf_refresher_cmd), "%s", hf_ref);
+    }
 }
 
 __attribute__((destructor))
@@ -1234,6 +1938,11 @@ static ssize_t s2_pread64(int orig_fd, void *buf, size_t count, off64_t offset) 
             }
         }
     }
+    if (g_s2_gcs_disable) {
+        ssize_t r = real_pread64(orig_fd, buf, count, offset);
+        __atomic_fetch_add(&g_stat_local, 1, __ATOMIC_RELAXED);
+        return r;
+    }
     /* Dual-regime concurrency gate:
      * Decode & short prompts (tot <= MAYA_S2_GCS_THRESH) stay 100% on local NVMe
      * (zero GCS RTT stragglers, full OS Page Cache population);
@@ -1276,9 +1985,194 @@ static ssize_t s2_pread64(int orig_fd, void *buf, size_t count, off64_t offset) 
     return r;
 }
 
-static int fuse_direct_pread64(struct TlsState *st, const char *path_buf,
-                               void *buf, size_t count, off64_t offset) {
+static int parse_hf_urls_buffer(char *raw, struct HfDirectEntry *out, int *out_n) {
+    int count = 0;
+    char *p = raw;
+    while (p && *p) {
+        char *eol = strchr(p, '\n');
+        if (eol) *eol++ = '\0';
+        size_t len = strlen(p);
+        while (len > 0 && p[len - 1] == '\r') p[--len] = '\0';
+        if (len > 0 && p[0] != '#') {
+            char *t1 = strchr(p, '\t');
+            char *t2 = t1 ? strchr(t1 + 1, '\t') : NULL;
+            if (t1 && t2) {
+                *t1 = '\0';
+                *t2 = '\0';
+                const char *rel = p;
+                while (*rel == '/') rel++;
+                const char *sz_str = t1 + 1;
+                const char *url = t2 + 1;
+                if (rel[0] && sz_str[0] && url[0] &&
+                    strlen(rel) < sizeof(out[0].rel_path) &&
+                    strlen(url) < sizeof(out[0].url)) {
+                    char *endp = NULL;
+                    errno = 0;
+                    unsigned long long sz = strtoull(sz_str, &endp, 10);
+                    if (errno == 0 && endp != sz_str && (!endp || *endp == '\0') && sz > 0) {
+                        if (count < MAX_HF_DIRECT) {
+                            struct HfDirectEntry *e = &out[count++];
+                            memset(e, 0, sizeof(*e));
+                            snprintf(e->rel_path, sizeof(e->rel_path), "%s", rel);
+                            e->size = (uint64_t)sz;
+                            snprintf(e->url, sizeof(e->url), "%s", url);
+                        }
+                    }
+                }
+            }
+        }
+        p = eol;
+    }
+    if (count <= 0) return -1;
+    *out_n = count;
+    return 0;
+}
+
+static int ensure_hf_urls(int force_refresh) {
+    if (!real_open || !real_close) return 0;
+    if (force_refresh && g_hf_refresher_cmd[0]) {
+        pthread_mutex_lock(&g_hf_refresh_lock);
+        uint64_t now_r = mono_ns();
+        if (now_r - g_hf_last_refresh_ns >= 5000000000ULL) {
+            int rc = system(g_hf_refresher_cmd);
+            (void)rc;
+            g_hf_last_refresh_ns = mono_ns();
+        }
+        pthread_mutex_unlock(&g_hf_refresh_lock);
+    }
+
+    uint64_t now = mono_ns();
+    pthread_mutex_lock(&g_hf_lock);
+    int need_check = force_refresh || (g_hf_n_entries == 0) || ((now - g_hf_last_stat_ns) >= 5000000000ULL);
+    if (need_check) {
+        g_hf_last_stat_ns = now;
+        struct stat st;
+        if (stat(g_hf_urls_path, &st) == 0) {
+            int mtime_changed = (st.st_mtim.tv_sec != g_hf_last_mtime.tv_sec ||
+                                 st.st_mtim.tv_nsec != g_hf_last_mtime.tv_nsec);
+            if (force_refresh || g_hf_n_entries == 0 || mtime_changed) {
+                int fd = real_open(g_hf_urls_path, O_RDONLY | O_CLOEXEC);
+                if (fd >= 0) {
+                    char *raw = (char *)malloc(HF_URLS_BUF_MAX);
+                    if (raw) {
+                        size_t n = 0;
+                        while (n + 1 < HF_URLS_BUF_MAX) {
+                            ssize_t r = read(fd, raw + n, HF_URLS_BUF_MAX - 1 - n);
+                            if (r < 0) {
+                                if (errno == EINTR) continue;
+                                break;
+                            }
+                            if (r == 0) break;
+                            n += (size_t)r;
+                        }
+                        raw[n] = '\0';
+                        struct HfDirectEntry tmp[MAX_HF_DIRECT];
+                        int tmp_n = 0;
+                        if (n > 0 && parse_hf_urls_buffer(raw, tmp, &tmp_n) == 0) {
+                            memcpy(g_hf_entries, tmp, (size_t)tmp_n * sizeof(tmp[0]));
+                            g_hf_n_entries = tmp_n;
+                            g_hf_last_mtime = st.st_mtim;
+                        }
+                        free(raw);
+                    }
+                    real_close(fd);
+                }
+            }
+        }
+    }
+    int ok = (g_hf_n_entries > 0);
+    pthread_mutex_unlock(&g_hf_lock);
+    return ok;
+}
+
+static int lookup_hf_direct(const char *rel_path, char *url_out, size_t url_cap,
+                            uint64_t *size_out, int force_refresh) {
+    if (!ensure_hf_urls(force_refresh)) return -1;
+    pthread_mutex_lock(&g_hf_lock);
+    for (int i = 0; i < g_hf_n_entries; i++) {
+        if (strcmp(g_hf_entries[i].rel_path, rel_path) == 0) {
+            snprintf(url_out, url_cap, "%s", g_hf_entries[i].url);
+            *size_out = g_hf_entries[i].size;
+            pthread_mutex_unlock(&g_hf_lock);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&g_hf_lock);
+    return -1;
+}
+
+static CURL *ensure_fuse_curl(struct TlsState *st) {
+    pthread_once(&g_curl_once, init_curl_global);
+    if (!st->fuse_eh) {
+        st->fuse_eh = curl_easy_init();
+        if (!st->fuse_eh) return NULL;
+        curl_easy_setopt(st->fuse_eh, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(st->fuse_eh, CURLOPT_TCP_NODELAY, 1L);
+        curl_easy_setopt(st->fuse_eh, CURLOPT_TCP_KEEPALIVE, 1L);
+        curl_easy_setopt(st->fuse_eh, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+        curl_easy_setopt(st->fuse_eh, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
+        curl_easy_setopt(st->fuse_eh, CURLOPT_TIMEOUT_MS, 60000L);
+        curl_easy_setopt(st->fuse_eh, CURLOPT_BUFFERSIZE, 524288L);
+        curl_easy_setopt(st->fuse_eh, CURLOPT_WRITEFUNCTION, fuse_direct_write_cb);
+    }
+    return st->fuse_eh;
+}
+
+static ssize_t fuse_direct_pread64(struct TlsState *st, const char *path_buf,
+                                   void *buf, size_t count, off64_t offset) {
     if (g_fuse_direct_disable) return -1;
+    if (count == 0) return 0;
+
+    if (strncmp(path_buf, g_hf_mount_prefix, g_hf_mount_prefix_len) == 0 &&
+        path_buf[g_hf_mount_prefix_len] != '\0') {
+        const char *rel = path_buf + g_hf_mount_prefix_len;
+        char url[HF_URL_MAX];
+        uint64_t fsize = 0;
+        if (lookup_hf_direct(rel, url, sizeof(url), &fsize, 0) != 0) return -1;
+        if ((uint64_t)offset >= fsize) return 0;
+
+        size_t want = count;
+        uint64_t remain = fsize - (uint64_t)offset;
+        if ((uint64_t)want > remain) want = (size_t)remain;
+        if (want == 0) return 0;
+
+        CURL *eh = ensure_fuse_curl(st);
+        if (!eh) return -1;
+
+        char range[64];
+        snprintf(range, sizeof(range), "%llu-%llu",
+                 (unsigned long long)offset,
+                 (unsigned long long)((uint64_t)offset + (uint64_t)want - 1ULL));
+
+        for (int attempt = 0; attempt < 2; attempt++) {
+            struct FuseDirectCtx ctx;
+            ctx.dst = (unsigned char *)buf;
+            ctx.cap = want;
+            ctx.got = 0;
+            ctx.overflow = 0;
+
+            curl_easy_setopt(eh, CURLOPT_URL, url);
+            curl_easy_setopt(eh, CURLOPT_HTTPHEADER, NULL);
+            curl_easy_setopt(eh, CURLOPT_FOLLOWLOCATION, 1L);
+            curl_easy_setopt(eh, CURLOPT_RANGE, range);
+            curl_easy_setopt(eh, CURLOPT_WRITEDATA, &ctx);
+
+            CURLcode res = curl_easy_perform(eh);
+            long code = 0;
+            if (res == CURLE_OK) {
+                curl_easy_getinfo(eh, CURLINFO_RESPONSE_CODE, &code);
+            }
+            if (res == CURLE_OK && code == 206 && !ctx.overflow && ctx.got == want) {
+                return (ssize_t)want;
+            }
+            if (attempt == 0 && res == CURLE_OK && (code == 401 || code == 403)) {
+                if (lookup_hf_direct(rel, url, sizeof(url), &fsize, 1) == 0) continue;
+            }
+            break;
+        }
+        return -1;
+    }
+
     if (strncmp(path_buf, "/mnt/gcs/", 9) != 0 || path_buf[9] == '\0') return -1;
     if (!ensure_gcs_token()) return -1;
 
@@ -1290,19 +2184,8 @@ static int fuse_direct_pread64(struct TlsState *st, const char *path_buf,
     pthread_mutex_unlock(&g_gcs_lock);
     if (!bucket_copy[0] || !tok_copy[0]) return -1;
 
-    pthread_once(&g_curl_once, init_curl_global);
-    if (!st->fuse_eh) {
-        st->fuse_eh = curl_easy_init();
-        if (!st->fuse_eh) return -1;
-        curl_easy_setopt(st->fuse_eh, CURLOPT_NOSIGNAL, 1L);
-        curl_easy_setopt(st->fuse_eh, CURLOPT_TCP_NODELAY, 1L);
-        curl_easy_setopt(st->fuse_eh, CURLOPT_TCP_KEEPALIVE, 1L);
-        curl_easy_setopt(st->fuse_eh, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
-        curl_easy_setopt(st->fuse_eh, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
-        curl_easy_setopt(st->fuse_eh, CURLOPT_TIMEOUT_MS, 60000L);
-        curl_easy_setopt(st->fuse_eh, CURLOPT_BUFFERSIZE, 524288L);
-        curl_easy_setopt(st->fuse_eh, CURLOPT_WRITEFUNCTION, fuse_direct_write_cb);
-    }
+    CURL *eh = ensure_fuse_curl(st);
+    if (!eh) return -1;
 
     char url[PATH_MAX + 600];
     snprintf(url, sizeof(url), "https://storage.googleapis.com/%s/%s", bucket_copy, path_buf + 9);
@@ -1320,21 +2203,22 @@ static int fuse_direct_pread64(struct TlsState *st, const char *path_buf,
 
         struct curl_slist *hdrs = curl_slist_append(NULL, tok_copy);
         if (!hdrs) return -1;
-        curl_easy_setopt(st->fuse_eh, CURLOPT_URL, url);
-        curl_easy_setopt(st->fuse_eh, CURLOPT_HTTPHEADER, hdrs);
-        curl_easy_setopt(st->fuse_eh, CURLOPT_RANGE, range);
-        curl_easy_setopt(st->fuse_eh, CURLOPT_WRITEDATA, &ctx);
+        curl_easy_setopt(eh, CURLOPT_URL, url);
+        curl_easy_setopt(eh, CURLOPT_FOLLOWLOCATION, 0L);
+        curl_easy_setopt(eh, CURLOPT_HTTPHEADER, hdrs);
+        curl_easy_setopt(eh, CURLOPT_RANGE, range);
+        curl_easy_setopt(eh, CURLOPT_WRITEDATA, &ctx);
 
-        CURLcode res = curl_easy_perform(st->fuse_eh);
-        curl_easy_setopt(st->fuse_eh, CURLOPT_HTTPHEADER, NULL);
+        CURLcode res = curl_easy_perform(eh);
+        curl_easy_setopt(eh, CURLOPT_HTTPHEADER, NULL);
         curl_slist_free_all(hdrs);
 
         long code = 0;
         if (res == CURLE_OK) {
-            curl_easy_getinfo(st->fuse_eh, CURLINFO_RESPONSE_CODE, &code);
+            curl_easy_getinfo(eh, CURLINFO_RESPONSE_CODE, &code);
         }
         if (res == CURLE_OK && code == 206 && !ctx.overflow && ctx.got == count) {
-            return 0;
+            return (ssize_t)count;
         }
         if (res == CURLE_OK && code == 401 && attempt == 0) {
             pthread_mutex_lock(&g_gcs_lock);
@@ -1373,8 +2257,9 @@ static ssize_t cached_pread64(int orig_fd, void *buf, size_t count, off64_t offs
             snprintf(path_buf, sizeof(path_buf), "%s", g_fd_path[orig_fd]);
         }
         pthread_mutex_unlock(&g_lock);
-        if (path_buf[0] && fuse_direct_pread64(st, path_buf, buf, count, offset) == 0) {
-            return (ssize_t)count;
+        if (path_buf[0]) {
+            ssize_t dr = fuse_direct_pread64(st, path_buf, buf, count, offset);
+            if (dr >= 0) return dr;
         }
         return real_pread64(orig_fd, buf, count, offset);
     }
@@ -1453,14 +2338,29 @@ static ssize_t cached_pread64(int orig_fd, void *buf, size_t count, off64_t offs
 
     off64_t win_start = (offset > CACHE_SMALL_PAD) ? ((offset - CACHE_SMALL_PAD) & ~(off64_t)4095) : 0;
     size_t total = 0;
-    while (total < CACHE_WIN_SIZE) {
-        ssize_t r = real_pread64(sl->tfd, sl->buf + total, CACHE_WIN_SIZE - total, win_start + (off64_t)total);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            break;
+    {
+        char path_buf[PATH_MAX];
+        path_buf[0] = '\0';
+        pthread_mutex_lock(&g_lock);
+        if (g_fd_kind[orig_fd] == FD_KIND_FUSE && g_fd_gen[orig_fd] == cur_gen && g_fd_path[orig_fd]) {
+            snprintf(path_buf, sizeof(path_buf), "%s", g_fd_path[orig_fd]);
         }
-        if (r == 0) break;
-        total += (size_t)r;
+        pthread_mutex_unlock(&g_lock);
+        if (path_buf[0]) {
+            ssize_t dr = fuse_direct_pread64(st, path_buf, sl->buf, CACHE_WIN_SIZE, win_start);
+            if (dr > 0) total = (size_t)dr;
+        }
+    }
+    if (total == 0) {
+        while (total < CACHE_WIN_SIZE) {
+            ssize_t r = real_pread64(sl->tfd, sl->buf + total, CACHE_WIN_SIZE - total, win_start + (off64_t)total);
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (r == 0) break;
+            total += (size_t)r;
+        }
     }
     if (total == 0) {
         sl->len = 0;
@@ -1497,10 +2397,11 @@ ssize_t __pread64_chk(int fd, void *buf, size_t nbytes, off64_t offset, size_t b
     return cached_pread64(fd, buf, nbytes, offset);
 }
 CEOF
-  gcc -Wall -Wextra -Werror -shared -fPIC -O2 -U_FORTIFY_SOURCE /tmp/gcs_tls_pread.c -o /tmp/gcs_tls_pread.so -lcurl -ldl -lpthread
-  mv -f /tmp/gcs_tls_pread.so "$WORK_DIR/gcs_tls_pread.so"
-  rm -f /tmp/gcs_tls_pread.c
-  PRELOAD_ENV="LD_PRELOAD=$WORK_DIR/gcs_tls_pread.so"
+  fi
+  gcc -Wall -Wextra -Werror -shared -fPIC -O2 -U_FORTIFY_SOURCE /tmp/gcs_tls_pread.c -o "$WORK_DIR/gcs_tls_pread.so.tmp" -lcurl -ldl -lpthread
+  mv -f "$WORK_DIR/gcs_tls_pread.so.tmp" "$WORK_DIR/gcs_tls_pread.so"
+  rm -f /tmp/gcs_tls_pread.c /tmp/hf_ro_fuse.c
+  PRELOAD_ENV="LD_PRELOAD=$WORK_DIR/gcs_tls_pread.so MAYA_HF_MOUNT_PREFIX=/mnt/hf/ MAYA_HF_URLS_PATH=/dev/shm/.maya_hf_urls"
 fi
 
 : > "$WORK_DIR/maya-ds4.log"

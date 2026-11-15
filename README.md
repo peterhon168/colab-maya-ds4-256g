@@ -14,13 +14,14 @@ Deploy **DeepSeek-V4.1-Flash-1017 (`Mix-256G` / `abliterated-256g`, 748B MoE)** 
 flowchart LR
     VM["Colab VM Boot"] --> CHECK{"/mnt/local-scratch >= 200G?"}
     CHECK -- "Yes (A100 Dual-Disk)" --> MODEA["Mode A: Shards 1-3 on /mnt/local-scratch, 4-7 on /, 100% RAM/VRAM Experts"]
-    CHECK -- "No (G4 236G Single-Disk)" --> GCSCHK{"GCS Key & Bucket Provided?"}
-    GCSCHK -- "Yes (Recommended)" --> MODEB1["Mode B1: Shards 1-4 NVMe + Shards 5-7 /mnt/gcs + gcs_tls_pread.so"]
-    GCSCHK -- "No (HF Fallback)" --> MODEB2["Mode B2: Remount /dev/shm 110G for Shard 2 + MAYA_DS4_DISK_SKIP_W=1.01"]
+    CHECK -- "No (G4 236G Single-Disk)" --> HFCHK{"HF Token Available? (Default Zero-Boot-GCS)"}
+    HFCHK -- "Yes (Zero-Egress B1)" --> MODEB1["Mode B1: Shards 1-4 NVMe (HF Xet $0) + Shards 5-7 /mnt/hf (hf_ro_fuse + HTTP/2 $0)"]
+    HFCHK -- "No + GCS Creds" --> MODEGCS["Mode B1-GCS: Legacy /mnt/gcs gcsfuse Fallback"]
+    HFCHK -- "No Creds" --> MODEB2["Mode B2: Remount /dev/shm 110G for Shard 2 + MAYA_DS4_DISK_SKIP_W=1.01"]
     MODEB1 --> TIER1["Shard 00002: mincore() OS Page Cache"]
-    TIER1 -- "Cache Miss (tot <= 160)" --> NVME["100% Local NVMe (Zero Network RTT for Decode)"]
-    TIER1 -- "Prefill Burst (tot > 160)" --> SPLIT["QD=16 Local NVMe + 752 Threads -> 8x8 HTTP/2 curl_multi (50Gbps GCS)"]
-    MODEB1 --> COLD["/mnt/gcs Reads > 256 KB -> Direct HTTPS HTTP/2 Range (49m -> ~12m Cold Load)"]
+    TIER1 -- "Cache Miss (tot <= 160)" --> NVME["100% Local NVMe (Zero Network RTT for Decode, $0)"]
+    TIER1 -- "Prefill Burst (tot > 160, w/ GCS Key)" --> SPLIT["QD=16 Local NVMe + 752 Threads -> 8x8 HTTP/2 curl_multi (50Gbps GCS)"]
+    MODEB1 --> COLD["/mnt/hf Reads > 256 KB & 2 MB Header Windows -> Direct HTTPS HTTP/2 Range (us.gcp.cdn.hf.co, $0/GB)"]
 ```
 
 ---
@@ -29,7 +30,7 @@ flowchart LR
 
 | Scenario | GPU & Host | Model & Storage Layout | Cold Load Time | Prefill Speed | Decode Speed (with `DSpark`) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **G4 Mode B1 (GCS Dual-Regime, Production)** | RTX PRO 6000 Blackwell (`96 GB`, `600 W`) + EPYC 9B45 (`48T`, `176.9 GiB` DDR5) | `Mix-256G` (`6,099–6,155` VRAM + `9,589–9,645` RAM experts, `disk_gb=0.0`, `Shards 1–4` NVMe, `5–7` GCS HTTP/2) | `~11.6–15.4 min` engine load (`~21–24 min` fresh empty VM end-to-end) | **`391.7–449.1 tok/s`** cold 78K–80K; **`531 tok/s`** mean (`546.7–5,596.9 tok/s` bursts) in 313-round Agent workload | **`42.02 tok/s`** cold benchmark median (`46.64 tok/s` warmed, `57.7 tok/s` peak); **`65.95 tok/s`** median (`P90 97.42 tok/s`) in real Agent sessions |
+| **G4 Mode B1 (Zero-Boot-GCS + Dual-Regime, Production)** | RTX PRO 6000 Blackwell (`96 GB`, `600 W`) + EPYC 9B45 (`48T`, `176.9 GiB` DDR5) | `Mix-256G` (`6,099–6,155` VRAM + `9,589–9,645` RAM experts, `disk_gb=0.0`, `Shards 1–4` NVMe via HF Xet `~305 MiB/s`, `5–7` `/mnt/hf` HTTP/2, GCS for `>160` bursts only) | `~11.6–15.4 min` engine load (`0 GB` boot GCS egress) | **`391.7–449.1 tok/s`** cold 78K–80K; **`531 tok/s`** mean (`546.7–5,596.9 tok/s` bursts) in 313-round Agent workload | **`42.02 tok/s`** cold benchmark median (`46.64 tok/s` warmed, `57.7 tok/s` peak); **`65.95 tok/s`** median (`P90 97.42 tok/s`) in real Agent sessions |
 | **G4 Mode B2 (Single-Disk `/dev/shm` Fallback)** | RTX PRO 6000 Blackwell (`96 GB`) | `Mix-256G` with `110G /dev/shm` for `Shard 00002`, skips `6.7%` cold disk experts (`MAYA_DS4_DISK_SKIP_W=1.01`) | `~15 min` | `~142 tok/s` (`DS4_PROMPT_PICK=length:65536`) | Up to **`48.7 tok/s`** (after `0.97 -> 48.7` fix) |
 | **A100 High-RAM (`128g` Measured / `256g` Mode A)** | A100-SXM4 (`80 GB`, `sm_80`) + `12 vCPU` Xeon (`167.1 GiB` RAM) + dual disks (`~585 GB` free) | `Mix-128G` measured; `Mode A` places `Shards 1–3` (`~183 GiB`) on `/mnt/local-scratch` for `100%` `Mix-256G` RAM/VRAM residency without `LD_PRELOAD` | `~15–18 min` | `455 tok/s` mean (`740–1,453 tok/s`) on `128g`; `450–900 tok/s` expected on `256g` | `66.9 tok/s` mean on `128g` (note: higher loop-guard frequency on `128g`) |
 
@@ -48,7 +49,8 @@ Detailed troubleshooting notes covering all eight pitfalls (`DriveFS` `D`-state 
 ├── docs/
 │   └── g4-vs-a100-748b-retrospective.md   # Full sanitized A100 vs G4 engineering retrospective
 ├── src/
-│   └── gcs_tls_pread.c                    # Extracted LD_PRELOAD dual-regime GCS/NVMe C source
+│   ├── hf_ro_fuse.c                       # Lightweight read-only FUSE3 mount (/mnt/hf) for HF CDN
+│   └── gcs_tls_pread.c                    # Extracted LD_PRELOAD dual-regime HF/GCS + NVMe I/O C source
 ├── scripts/
 │   ├── deploy_from_mac.sh                 # One-command uploader & remote bootstrap via colab-cli
 │   ├── start_g4_256g.sh                   # Adaptive Mode A / Mode B1 / Mode B2 runtime launcher

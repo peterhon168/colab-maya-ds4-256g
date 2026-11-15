@@ -20,6 +20,7 @@
  *        with lossless real_pread64() fallback on timeout or gateway reconnect.
  *
  * Auth / Config Files Read at Runtime:
+ *   - /dev/shm/.maya_hf_urls      (chmod 600 presigned HF CDN URL table: <rel_path>\t<size>\t<url>)
  *   - /tmp/gcs-bucket             (single line GCS bucket name)
  *   - /dev/shm/.maya_gcs_token    (chmod 600 OAuth2 access token refreshed by background daemon)
  */
@@ -59,6 +60,12 @@
 #define H2_MAX_FREE_HANDLES 160
 #define TOKEN_PATH "/dev/shm/.maya_gcs_token"
 #define BUCKET_PATH "/tmp/gcs-bucket"
+#define HF_DEFAULT_MOUNT_PREFIX "/mnt/hf/"
+#define HF_DEFAULT_URLS_PATH "/dev/shm/.maya_hf_urls"
+#define HF_DEFAULT_REFRESHER "/content/project-maya/maya_url_token_refresher.sh --hf-only"
+#define MAX_HF_DIRECT 16
+#define HF_URL_MAX 8192
+#define HF_URLS_BUF_MAX (256 * 1024)
 #define S2_OBJ_REL "Mix-256G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-00002-of-00007.gguf"
 #define S2_SUFFIX "-00002-of-00007.gguf"
 
@@ -96,6 +103,24 @@ static char g_gcs_url[1024];
 static char g_tok_hdr[2304];
 static uint64_t g_tok_ver = 0;
 static uint64_t g_tok_last_ns = 0;
+
+struct HfDirectEntry {
+    char rel_path[512];
+    uint64_t size;
+    char url[HF_URL_MAX];
+};
+
+static char g_hf_mount_prefix[PATH_MAX] = HF_DEFAULT_MOUNT_PREFIX;
+static size_t g_hf_mount_prefix_len = 8;
+static char g_hf_urls_path[PATH_MAX] = HF_DEFAULT_URLS_PATH;
+static char g_hf_refresher_cmd[PATH_MAX] = HF_DEFAULT_REFRESHER;
+static pthread_mutex_t g_hf_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_hf_refresh_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct HfDirectEntry g_hf_entries[MAX_HF_DIRECT];
+static int g_hf_n_entries = 0;
+static struct timespec g_hf_last_mtime;
+static uint64_t g_hf_last_stat_ns = 0;
+static uint64_t g_hf_last_refresh_ns = 0;
 
 static uint64_t g_stat_pc = 0;
 static uint64_t g_stat_local = 0;
@@ -204,6 +229,24 @@ static void init_syms(void) {
     if (fdd && atoi(fdd) != 0) g_fuse_direct_disable = 1;
     const char *dbg = getenv("MAYA_S2_DEBUG");
     if (dbg && atoi(dbg) != 0) g_s2_debug = 1;
+    const char *hf_pref = getenv("MAYA_HF_MOUNT_PREFIX");
+    if (hf_pref && hf_pref[0]) {
+        snprintf(g_hf_mount_prefix, sizeof(g_hf_mount_prefix), "%s", hf_pref);
+        size_t plen = strlen(g_hf_mount_prefix);
+        if (plen > 0 && g_hf_mount_prefix[plen - 1] != '/' && plen + 1 < sizeof(g_hf_mount_prefix)) {
+            g_hf_mount_prefix[plen++] = '/';
+            g_hf_mount_prefix[plen] = '\0';
+        }
+        g_hf_mount_prefix_len = plen;
+    }
+    const char *hf_urls = getenv("MAYA_HF_URLS_PATH");
+    if (hf_urls && hf_urls[0]) {
+        snprintf(g_hf_urls_path, sizeof(g_hf_urls_path), "%s", hf_urls);
+    }
+    const char *hf_ref = getenv("MAYA_HF_REFRESHER");
+    if (hf_ref) {
+        snprintf(g_hf_refresher_cmd, sizeof(g_hf_refresher_cmd), "%s", hf_ref);
+    }
 }
 
 __attribute__((destructor))
@@ -761,6 +804,11 @@ static ssize_t s2_pread64(int orig_fd, void *buf, size_t count, off64_t offset) 
             }
         }
     }
+    if (g_s2_gcs_disable) {
+        ssize_t r = real_pread64(orig_fd, buf, count, offset);
+        __atomic_fetch_add(&g_stat_local, 1, __ATOMIC_RELAXED);
+        return r;
+    }
     /* Dual-regime concurrency gate:
      * Decode & short prompts (tot <= MAYA_S2_GCS_THRESH) stay 100% on local NVMe
      * (zero GCS RTT stragglers, full OS Page Cache population);
@@ -803,9 +851,194 @@ static ssize_t s2_pread64(int orig_fd, void *buf, size_t count, off64_t offset) 
     return r;
 }
 
-static int fuse_direct_pread64(struct TlsState *st, const char *path_buf,
-                               void *buf, size_t count, off64_t offset) {
+static int parse_hf_urls_buffer(char *raw, struct HfDirectEntry *out, int *out_n) {
+    int count = 0;
+    char *p = raw;
+    while (p && *p) {
+        char *eol = strchr(p, '\n');
+        if (eol) *eol++ = '\0';
+        size_t len = strlen(p);
+        while (len > 0 && p[len - 1] == '\r') p[--len] = '\0';
+        if (len > 0 && p[0] != '#') {
+            char *t1 = strchr(p, '\t');
+            char *t2 = t1 ? strchr(t1 + 1, '\t') : NULL;
+            if (t1 && t2) {
+                *t1 = '\0';
+                *t2 = '\0';
+                const char *rel = p;
+                while (*rel == '/') rel++;
+                const char *sz_str = t1 + 1;
+                const char *url = t2 + 1;
+                if (rel[0] && sz_str[0] && url[0] &&
+                    strlen(rel) < sizeof(out[0].rel_path) &&
+                    strlen(url) < sizeof(out[0].url)) {
+                    char *endp = NULL;
+                    errno = 0;
+                    unsigned long long sz = strtoull(sz_str, &endp, 10);
+                    if (errno == 0 && endp != sz_str && (!endp || *endp == '\0') && sz > 0) {
+                        if (count < MAX_HF_DIRECT) {
+                            struct HfDirectEntry *e = &out[count++];
+                            memset(e, 0, sizeof(*e));
+                            snprintf(e->rel_path, sizeof(e->rel_path), "%s", rel);
+                            e->size = (uint64_t)sz;
+                            snprintf(e->url, sizeof(e->url), "%s", url);
+                        }
+                    }
+                }
+            }
+        }
+        p = eol;
+    }
+    if (count <= 0) return -1;
+    *out_n = count;
+    return 0;
+}
+
+static int ensure_hf_urls(int force_refresh) {
+    if (!real_open || !real_close) return 0;
+    if (force_refresh && g_hf_refresher_cmd[0]) {
+        pthread_mutex_lock(&g_hf_refresh_lock);
+        uint64_t now_r = mono_ns();
+        if (now_r - g_hf_last_refresh_ns >= 5000000000ULL) {
+            int rc = system(g_hf_refresher_cmd);
+            (void)rc;
+            g_hf_last_refresh_ns = mono_ns();
+        }
+        pthread_mutex_unlock(&g_hf_refresh_lock);
+    }
+
+    uint64_t now = mono_ns();
+    pthread_mutex_lock(&g_hf_lock);
+    int need_check = force_refresh || (g_hf_n_entries == 0) || ((now - g_hf_last_stat_ns) >= 5000000000ULL);
+    if (need_check) {
+        g_hf_last_stat_ns = now;
+        struct stat st;
+        if (stat(g_hf_urls_path, &st) == 0) {
+            int mtime_changed = (st.st_mtim.tv_sec != g_hf_last_mtime.tv_sec ||
+                                 st.st_mtim.tv_nsec != g_hf_last_mtime.tv_nsec);
+            if (force_refresh || g_hf_n_entries == 0 || mtime_changed) {
+                int fd = real_open(g_hf_urls_path, O_RDONLY | O_CLOEXEC);
+                if (fd >= 0) {
+                    char *raw = (char *)malloc(HF_URLS_BUF_MAX);
+                    if (raw) {
+                        size_t n = 0;
+                        while (n + 1 < HF_URLS_BUF_MAX) {
+                            ssize_t r = read(fd, raw + n, HF_URLS_BUF_MAX - 1 - n);
+                            if (r < 0) {
+                                if (errno == EINTR) continue;
+                                break;
+                            }
+                            if (r == 0) break;
+                            n += (size_t)r;
+                        }
+                        raw[n] = '\0';
+                        struct HfDirectEntry tmp[MAX_HF_DIRECT];
+                        int tmp_n = 0;
+                        if (n > 0 && parse_hf_urls_buffer(raw, tmp, &tmp_n) == 0) {
+                            memcpy(g_hf_entries, tmp, (size_t)tmp_n * sizeof(tmp[0]));
+                            g_hf_n_entries = tmp_n;
+                            g_hf_last_mtime = st.st_mtim;
+                        }
+                        free(raw);
+                    }
+                    real_close(fd);
+                }
+            }
+        }
+    }
+    int ok = (g_hf_n_entries > 0);
+    pthread_mutex_unlock(&g_hf_lock);
+    return ok;
+}
+
+static int lookup_hf_direct(const char *rel_path, char *url_out, size_t url_cap,
+                            uint64_t *size_out, int force_refresh) {
+    if (!ensure_hf_urls(force_refresh)) return -1;
+    pthread_mutex_lock(&g_hf_lock);
+    for (int i = 0; i < g_hf_n_entries; i++) {
+        if (strcmp(g_hf_entries[i].rel_path, rel_path) == 0) {
+            snprintf(url_out, url_cap, "%s", g_hf_entries[i].url);
+            *size_out = g_hf_entries[i].size;
+            pthread_mutex_unlock(&g_hf_lock);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&g_hf_lock);
+    return -1;
+}
+
+static CURL *ensure_fuse_curl(struct TlsState *st) {
+    pthread_once(&g_curl_once, init_curl_global);
+    if (!st->fuse_eh) {
+        st->fuse_eh = curl_easy_init();
+        if (!st->fuse_eh) return NULL;
+        curl_easy_setopt(st->fuse_eh, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(st->fuse_eh, CURLOPT_TCP_NODELAY, 1L);
+        curl_easy_setopt(st->fuse_eh, CURLOPT_TCP_KEEPALIVE, 1L);
+        curl_easy_setopt(st->fuse_eh, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+        curl_easy_setopt(st->fuse_eh, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
+        curl_easy_setopt(st->fuse_eh, CURLOPT_TIMEOUT_MS, 60000L);
+        curl_easy_setopt(st->fuse_eh, CURLOPT_BUFFERSIZE, 524288L);
+        curl_easy_setopt(st->fuse_eh, CURLOPT_WRITEFUNCTION, fuse_direct_write_cb);
+    }
+    return st->fuse_eh;
+}
+
+static ssize_t fuse_direct_pread64(struct TlsState *st, const char *path_buf,
+                                   void *buf, size_t count, off64_t offset) {
     if (g_fuse_direct_disable) return -1;
+    if (count == 0) return 0;
+
+    if (strncmp(path_buf, g_hf_mount_prefix, g_hf_mount_prefix_len) == 0 &&
+        path_buf[g_hf_mount_prefix_len] != '\0') {
+        const char *rel = path_buf + g_hf_mount_prefix_len;
+        char url[HF_URL_MAX];
+        uint64_t fsize = 0;
+        if (lookup_hf_direct(rel, url, sizeof(url), &fsize, 0) != 0) return -1;
+        if ((uint64_t)offset >= fsize) return 0;
+
+        size_t want = count;
+        uint64_t remain = fsize - (uint64_t)offset;
+        if ((uint64_t)want > remain) want = (size_t)remain;
+        if (want == 0) return 0;
+
+        CURL *eh = ensure_fuse_curl(st);
+        if (!eh) return -1;
+
+        char range[64];
+        snprintf(range, sizeof(range), "%llu-%llu",
+                 (unsigned long long)offset,
+                 (unsigned long long)((uint64_t)offset + (uint64_t)want - 1ULL));
+
+        for (int attempt = 0; attempt < 2; attempt++) {
+            struct FuseDirectCtx ctx;
+            ctx.dst = (unsigned char *)buf;
+            ctx.cap = want;
+            ctx.got = 0;
+            ctx.overflow = 0;
+
+            curl_easy_setopt(eh, CURLOPT_URL, url);
+            curl_easy_setopt(eh, CURLOPT_HTTPHEADER, NULL);
+            curl_easy_setopt(eh, CURLOPT_FOLLOWLOCATION, 1L);
+            curl_easy_setopt(eh, CURLOPT_RANGE, range);
+            curl_easy_setopt(eh, CURLOPT_WRITEDATA, &ctx);
+
+            CURLcode res = curl_easy_perform(eh);
+            long code = 0;
+            if (res == CURLE_OK) {
+                curl_easy_getinfo(eh, CURLINFO_RESPONSE_CODE, &code);
+            }
+            if (res == CURLE_OK && code == 206 && !ctx.overflow && ctx.got == want) {
+                return (ssize_t)want;
+            }
+            if (attempt == 0 && res == CURLE_OK && (code == 401 || code == 403)) {
+                if (lookup_hf_direct(rel, url, sizeof(url), &fsize, 1) == 0) continue;
+            }
+            break;
+        }
+        return -1;
+    }
+
     if (strncmp(path_buf, "/mnt/gcs/", 9) != 0 || path_buf[9] == '\0') return -1;
     if (!ensure_gcs_token()) return -1;
 
@@ -817,19 +1050,8 @@ static int fuse_direct_pread64(struct TlsState *st, const char *path_buf,
     pthread_mutex_unlock(&g_gcs_lock);
     if (!bucket_copy[0] || !tok_copy[0]) return -1;
 
-    pthread_once(&g_curl_once, init_curl_global);
-    if (!st->fuse_eh) {
-        st->fuse_eh = curl_easy_init();
-        if (!st->fuse_eh) return -1;
-        curl_easy_setopt(st->fuse_eh, CURLOPT_NOSIGNAL, 1L);
-        curl_easy_setopt(st->fuse_eh, CURLOPT_TCP_NODELAY, 1L);
-        curl_easy_setopt(st->fuse_eh, CURLOPT_TCP_KEEPALIVE, 1L);
-        curl_easy_setopt(st->fuse_eh, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
-        curl_easy_setopt(st->fuse_eh, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
-        curl_easy_setopt(st->fuse_eh, CURLOPT_TIMEOUT_MS, 60000L);
-        curl_easy_setopt(st->fuse_eh, CURLOPT_BUFFERSIZE, 524288L);
-        curl_easy_setopt(st->fuse_eh, CURLOPT_WRITEFUNCTION, fuse_direct_write_cb);
-    }
+    CURL *eh = ensure_fuse_curl(st);
+    if (!eh) return -1;
 
     char url[PATH_MAX + 600];
     snprintf(url, sizeof(url), "https://storage.googleapis.com/%s/%s", bucket_copy, path_buf + 9);
@@ -847,21 +1069,22 @@ static int fuse_direct_pread64(struct TlsState *st, const char *path_buf,
 
         struct curl_slist *hdrs = curl_slist_append(NULL, tok_copy);
         if (!hdrs) return -1;
-        curl_easy_setopt(st->fuse_eh, CURLOPT_URL, url);
-        curl_easy_setopt(st->fuse_eh, CURLOPT_HTTPHEADER, hdrs);
-        curl_easy_setopt(st->fuse_eh, CURLOPT_RANGE, range);
-        curl_easy_setopt(st->fuse_eh, CURLOPT_WRITEDATA, &ctx);
+        curl_easy_setopt(eh, CURLOPT_URL, url);
+        curl_easy_setopt(eh, CURLOPT_FOLLOWLOCATION, 0L);
+        curl_easy_setopt(eh, CURLOPT_HTTPHEADER, hdrs);
+        curl_easy_setopt(eh, CURLOPT_RANGE, range);
+        curl_easy_setopt(eh, CURLOPT_WRITEDATA, &ctx);
 
-        CURLcode res = curl_easy_perform(st->fuse_eh);
-        curl_easy_setopt(st->fuse_eh, CURLOPT_HTTPHEADER, NULL);
+        CURLcode res = curl_easy_perform(eh);
+        curl_easy_setopt(eh, CURLOPT_HTTPHEADER, NULL);
         curl_slist_free_all(hdrs);
 
         long code = 0;
         if (res == CURLE_OK) {
-            curl_easy_getinfo(st->fuse_eh, CURLINFO_RESPONSE_CODE, &code);
+            curl_easy_getinfo(eh, CURLINFO_RESPONSE_CODE, &code);
         }
         if (res == CURLE_OK && code == 206 && !ctx.overflow && ctx.got == count) {
-            return 0;
+            return (ssize_t)count;
         }
         if (res == CURLE_OK && code == 401 && attempt == 0) {
             pthread_mutex_lock(&g_gcs_lock);
@@ -900,8 +1123,9 @@ static ssize_t cached_pread64(int orig_fd, void *buf, size_t count, off64_t offs
             snprintf(path_buf, sizeof(path_buf), "%s", g_fd_path[orig_fd]);
         }
         pthread_mutex_unlock(&g_lock);
-        if (path_buf[0] && fuse_direct_pread64(st, path_buf, buf, count, offset) == 0) {
-            return (ssize_t)count;
+        if (path_buf[0]) {
+            ssize_t dr = fuse_direct_pread64(st, path_buf, buf, count, offset);
+            if (dr >= 0) return dr;
         }
         return real_pread64(orig_fd, buf, count, offset);
     }
@@ -980,14 +1204,29 @@ static ssize_t cached_pread64(int orig_fd, void *buf, size_t count, off64_t offs
 
     off64_t win_start = (offset > CACHE_SMALL_PAD) ? ((offset - CACHE_SMALL_PAD) & ~(off64_t)4095) : 0;
     size_t total = 0;
-    while (total < CACHE_WIN_SIZE) {
-        ssize_t r = real_pread64(sl->tfd, sl->buf + total, CACHE_WIN_SIZE - total, win_start + (off64_t)total);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            break;
+    {
+        char path_buf[PATH_MAX];
+        path_buf[0] = '\0';
+        pthread_mutex_lock(&g_lock);
+        if (g_fd_kind[orig_fd] == FD_KIND_FUSE && g_fd_gen[orig_fd] == cur_gen && g_fd_path[orig_fd]) {
+            snprintf(path_buf, sizeof(path_buf), "%s", g_fd_path[orig_fd]);
         }
-        if (r == 0) break;
-        total += (size_t)r;
+        pthread_mutex_unlock(&g_lock);
+        if (path_buf[0]) {
+            ssize_t dr = fuse_direct_pread64(st, path_buf, sl->buf, CACHE_WIN_SIZE, win_start);
+            if (dr > 0) total = (size_t)dr;
+        }
+    }
+    if (total == 0) {
+        while (total < CACHE_WIN_SIZE) {
+            ssize_t r = real_pread64(sl->tfd, sl->buf + total, CACHE_WIN_SIZE - total, win_start + (off64_t)total);
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (r == 0) break;
+            total += (size_t)r;
+        }
     }
     if (total == 0) {
         sl->len = 0;

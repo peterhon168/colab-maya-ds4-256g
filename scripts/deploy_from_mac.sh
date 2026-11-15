@@ -14,6 +14,13 @@ fi
 colab upload -s "$SESSION" "$RES_DIR/maya-ds4.json" /tmp/maya-ds4.json
 colab upload -s "$SESSION" "$RES_DIR/pack-meta-256g.tar.gz" /tmp/pack-meta-256g.tar.gz
 colab upload -s "$SESSION" "$SCRIPT_DIR/start_g4_256g.sh" /tmp/start_g4_256g.sh
+SRC_DIR="$(cd "$SCRIPT_DIR/../src" 2>/dev/null && pwd || true)"
+if [ -n "$SRC_DIR" ] && [ -f "$SRC_DIR/hf_ro_fuse.c" ]; then
+  colab upload -s "$SESSION" "$SRC_DIR/hf_ro_fuse.c" /tmp/hf_ro_fuse.c
+fi
+if [ -n "$SRC_DIR" ] && [ -f "$SRC_DIR/gcs_tls_pread.c" ]; then
+  colab upload -s "$SESSION" "$SRC_DIR/gcs_tls_pread.c" /tmp/gcs_tls_pread.c
+fi
 
 # 凭据优先级: 环境变量 > ~/.config/maya-gcs/ (推荐，独立于 Git 仓库之外) > 本地被 .gitignore 忽略的 resources/
 GCS_KEY_FILE=""
