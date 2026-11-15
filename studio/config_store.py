@@ -55,6 +55,7 @@ CREDENTIAL_FILES = {
     "hf_token": "hf-token",
     "gcs_key_json": "gcs-key.json",
     "gcs_bucket": "bucket",
+    "maya_api_key": "maya-api-key",
     "strata_api_key": "strata-api-key",
 }
 
@@ -469,6 +470,7 @@ class ConfigStore:
         _handle_clear("clear_hf_token", "hf_token")
         _handle_clear("clear_gcs_key", "gcs_key_json")
         _handle_clear("clear_gcs_bucket", "gcs_bucket")
+        _handle_clear("clear_maya_api_key", "maya_api_key")
         _handle_clear("clear_strata_api_key", "strata_api_key")
 
         hf_token = payload.get("hf_token")
@@ -495,6 +497,10 @@ class ConfigStore:
                 json.dumps(parsed, indent=2) + "\n",
             )
 
+        maya_key = payload.get("maya_api_key")
+        if isinstance(maya_key, str) and maya_key.strip():
+            atomic_write_secret(CONFIG_DIR / CREDENTIAL_FILES["maya_api_key"], maya_key.strip() + "\n")
+
         strata_key = payload.get("strata_api_key")
         if isinstance(strata_key, str) and strata_key.strip():
             atomic_write_secret(CONFIG_DIR / CREDENTIAL_FILES["strata_api_key"], strata_key.strip() + "\n")
@@ -508,6 +514,9 @@ class ConfigStore:
             self.read_credential_file("gcs_key_json")
         )
         gcs_bucket = self.read_credential_file("gcs_bucket")
+        maya_key_exists = (CONFIG_DIR / CREDENTIAL_FILES["maya_api_key"]).is_file() and bool(
+            self.read_credential_file("maya_api_key")
+        )
         strata_key_exists = (CONFIG_DIR / CREDENTIAL_FILES["strata_api_key"]).is_file() and bool(
             self.read_credential_file("strata_api_key")
         )
@@ -517,6 +526,7 @@ class ConfigStore:
             "has_hf_token": hf_exists,
             "has_gcs_key": gcs_key_exists,
             "gcs_bucket": gcs_bucket,
+            "has_maya_key": maya_key_exists,
             "has_strata_key": strata_key_exists,
             "pi_sync_available": pi_models.is_file(),
         }

@@ -2404,6 +2404,32 @@ CEOF
   PRELOAD_ENV="LD_PRELOAD=$WORK_DIR/gcs_tls_pread.so MAYA_HF_MOUNT_PREFIX=/mnt/hf/ MAYA_HF_URLS_PATH=/dev/shm/.maya_hf_urls"
 fi
 
+# 若存在公网网关鉴权密钥 (/tmp/maya-api-key 或 MAYA_API_KEY)，安全写入 maya-ds4.json (chmod 600)，不通过 CLI 暴露在 ps 中
+RESOLVED_MAYA_API_KEY="${MAYA_API_KEY:-}"
+if [ -z "$RESOLVED_MAYA_API_KEY" ] && [ -f /tmp/maya-api-key ]; then
+  RESOLVED_MAYA_API_KEY="$(tr -d '[:space:]' < /tmp/maya-api-key 2>/dev/null || true)"
+fi
+rm -f /tmp/maya-api-key
+if [ -n "$RESOLVED_MAYA_API_KEY" ]; then
+  MAYA_INJECT_KEY="$RESOLVED_MAYA_API_KEY" python3 - "$WORK_DIR/maya-ds4.json" << 'PY'
+import json, os, sys
+cfg_path = sys.argv[1]
+key = os.environ.get("MAYA_INJECT_KEY", "").strip()
+if key:
+    with open(cfg_path, "r", encoding="utf-8") as fh:
+        cfg = json.load(fh)
+    cfg["api_key"] = key
+    tmp_path = cfg_path + f".tmp.{os.getpid()}"
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh, indent=1, ensure_ascii=False)
+        fh.write("\n")
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, cfg_path)
+PY
+  unset RESOLVED_MAYA_API_KEY
+  echo "[Maya] 已注入公网网关 API 鉴权密钥至 maya-ds4.json (chmod 0600)"
+fi
+
 : > "$WORK_DIR/maya-ds4.log"
 env $PRELOAD_ENV MAYA_SH=1 nohup "$WORK_DIR/.venv/bin/python" "$WORK_DIR/maya.py" --config "$WORK_DIR/maya-ds4.json" --port 8000 --plain > "$WORK_DIR/maya-console.log" 2>&1 < /dev/null &
 if ! pgrep -f "cloudflared.*8000" >/dev/null 2>&1; then

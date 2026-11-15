@@ -6,6 +6,7 @@ import http.server
 import json
 import mimetypes
 import os
+import pwd
 import queue
 import socketserver
 import threading
@@ -73,8 +74,29 @@ def _fallback_index_html(studio_port: int, proxy_port: int) -> bytes:
     return html.encode("utf-8")
 
 
+def _resolve_pi_web_url() -> str:
+    """Resolve optional local pi-web URL while isolating temporary HOME test runs."""
+    raw = os.environ.get("PI_WEB_URL")
+    if raw is not None:
+        cleaned = raw.strip().rstrip("/")
+        if cleaned.lower() in ("", "off", "0", "false", "none"):
+            return ""
+        return cleaned
+    try:
+        real_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+        if Path.home().resolve() != real_home:
+            return ""
+    except Exception:
+        pass
+    return "http://127.0.0.1:30141"
+
+
 class StudioRuntime:
     """Owns Studio state, background telemetry polling, Colab bridge, and reverse proxy."""
+
+    def _resolve_engine_api_key(self, kind: str) -> str:
+        cred_key = "strata_api_key" if kind == "strata" else "maya_api_key"
+        return self.config.read_credential_file(cred_key)
 
     def __init__(
         self,
@@ -90,11 +112,7 @@ class StudioRuntime:
         self.logs = LogBroker()
         self.config = ConfigStore()
 
-        initial_api_key = (
-            self.config.read_credential_file("strata_api_key")
-            if self.config.engine_kind == "strata"
-            else ""
-        )
+        initial_api_key = self._resolve_engine_api_key(self.config.engine_kind)
         self.proxy = EngineProxyServer(
             host=host,
             proxy_port=proxy_port,
@@ -188,7 +206,8 @@ class StudioRuntime:
             }
 
     def build_state_payload(self) -> dict[str, Any]:
-        upstream, kind, _ = self.proxy.state.snapshot()
+        upstream, kind, api_key = self.proxy.state.snapshot()
+        has_api_key = bool(api_key or self._resolve_engine_api_key(kind))
         tel = self.get_telemetry_snapshot()
         settings = self.config.get_settings()
         return {
@@ -209,6 +228,7 @@ class StudioRuntime:
                 "upstream_masked": mask_url(upstream),
                 "proxy_url": f"http://127.0.0.1:{self.proxy_port}",
                 "openai_base_url": f"http://127.0.0.1:{self.proxy_port}/v1",
+                "has_api_key": has_api_key,
                 "model_id": tel["model_id"],
                 "telemetry": tel["telemetry"],
             },
@@ -243,17 +263,16 @@ class StudioRuntime:
             self.config.update_settings({"strata_url": upstream})
 
         api_key_arg = body.get("api_key")
+        cred_clear_key = "clear_strata_api_key" if kind == "strata" else "clear_maya_api_key"
+        cred_save_key = "strata_api_key" if kind == "strata" else "maya_api_key"
         if body.get("clear_api_key") is True:
             api_key = ""
-            self.config.save_credentials({"clear_strata_api_key": True})
+            self.config.save_credentials({cred_clear_key: True})
         elif isinstance(api_key_arg, str) and api_key_arg.strip():
             api_key = api_key_arg.strip()
-            if kind == "strata":
-                self.config.save_credentials({"strata_api_key": api_key})
-        elif kind == "strata":
-            api_key = self.config.read_credential_file("strata_api_key")
+            self.config.save_credentials({cred_save_key: api_key})
         else:
-            api_key = ""
+            api_key = self._resolve_engine_api_key(kind)
 
         self.config.set_selection(engine_kind=kind, maya_mode=mode, upstream_url=upstream)
         self.proxy.set_upstream(upstream, engine_kind=kind, api_key=api_key)
@@ -303,7 +322,8 @@ class StudioRuntime:
         target = str(body.get("target") or "pi").strip().lower()
         use_local_proxy = body.get("use_local_proxy", True) is not False
 
-        upstream, kind, _ = self.proxy.state.snapshot()
+        upstream, kind, proxy_api_key = self.proxy.state.snapshot()
+        active_api_key = proxy_api_key or self._resolve_engine_api_key(kind)
         tel = self.get_telemetry_snapshot()
         settings = self.config.get_settings()
 
@@ -322,6 +342,7 @@ class StudioRuntime:
         pi_updated = False
         pi_web_synced = False
         provider_key = "A100" if kind == "maya" else "strata-studio"
+        pi_api_key = active_api_key if (not use_local_proxy and active_api_key) else ""
 
         pi_path = Path.home() / ".pi" / "agent" / "models.json"
         if target in ("pi", "all") and pi_path.is_file():
@@ -338,7 +359,7 @@ class StudioRuntime:
                     existing = {
                         "api": "openai-completions",
                         "baseUrl": base_url,
-                        "apiKey": "EMPTY",
+                        "apiKey": pi_api_key or "EMPTY",
                         "models": [
                             {
                                 "id": model_id,
@@ -352,6 +373,8 @@ class StudioRuntime:
                     providers[provider_key] = existing
                 else:
                     existing["baseUrl"] = base_url
+                    if pi_api_key:
+                        existing["apiKey"] = pi_api_key
                     models = existing.setdefault("models", [])
                     if not models:
                         models.append(
@@ -377,27 +400,29 @@ class StudioRuntime:
                 pi_updated = True
                 self.logs.emit("system", "success", f"已同步 ~/.pi/agent/models.json (provider={provider_key}, baseUrl={base_url})")
 
-                # Notify pi-web (127.0.0.1:30141) if running (bypassing any system HTTP_PROXY)
-                try:
-                    no_proxy_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-                    req1 = urllib.request.Request(
-                        "http://127.0.0.1:30141/api/models-config",
-                        data=json.dumps(cfg).encode("utf-8"),
-                        headers={"Content-Type": "application/json"},
-                        method="PUT",
-                    )
-                    no_proxy_opener.open(req1, timeout=2.5).read()
-                    req2 = urllib.request.Request(
-                        "http://127.0.0.1:30141/api/models/refresh",
-                        data=b"{}",
-                        headers={"Content-Type": "application/json"},
-                        method="POST",
-                    )
-                    no_proxy_opener.open(req2, timeout=2.5).read()
-                    pi_web_synced = True
-                    self.logs.emit("system", "info", "已通知 pi-web (127.0.0.1:30141) 刷新模型配置")
-                except Exception:
-                    pass
+                # Notify pi-web if running and not disabled / isolated (bypassing any system HTTP_PROXY)
+                pi_web_url = _resolve_pi_web_url()
+                if pi_web_url:
+                    try:
+                        no_proxy_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                        req1 = urllib.request.Request(
+                            f"{pi_web_url}/api/models-config",
+                            data=json.dumps(cfg).encode("utf-8"),
+                            headers={"Content-Type": "application/json"},
+                            method="PUT",
+                        )
+                        no_proxy_opener.open(req1, timeout=2.5).read()
+                        req2 = urllib.request.Request(
+                            f"{pi_web_url}/api/models/refresh",
+                            data=b"{}",
+                            headers={"Content-Type": "application/json"},
+                            method="POST",
+                        )
+                        no_proxy_opener.open(req2, timeout=2.5).read()
+                        pi_web_synced = True
+                        self.logs.emit("system", "info", f"已通知 pi-web ({pi_web_url}) 刷新模型配置")
+                    except Exception:
+                        pass
             except Exception as exc:
                 self.logs.emit("system", "warn", f"更新 ~/.pi/agent/models.json 失败: {exc}")
 
@@ -405,6 +430,11 @@ class StudioRuntime:
             mask_url(upstream).rstrip("/") + "/v1" if settings.get("mask_urls") and upstream else base_url
         )
         root_snippet_base = snippet_base[:-3] if snippet_base.endswith("/v1") else snippet_base
+        snippet_key = (
+            "sk-maya-******"
+            if (not use_local_proxy and active_api_key and settings.get("mask_urls", True))
+            else (active_api_key if (not use_local_proxy and active_api_key) else "EMPTY")
+        )
 
         snippets = {
             "base_url": snippet_base,
@@ -415,7 +445,7 @@ class StudioRuntime:
                         provider_key: {
                             "api": "openai-completions",
                             "baseUrl": snippet_base,
-                            "apiKey": "EMPTY",
+                            "apiKey": snippet_key,
                             "models": [
                                 {
                                     "id": model_id,
@@ -432,7 +462,7 @@ class StudioRuntime:
             ),
             "openai_python": (
                 "from openai import OpenAI\n\n"
-                f'client = OpenAI(base_url="{snippet_base}", api_key="EMPTY")\n'
+                f'client = OpenAI(base_url="{snippet_base}", api_key="{snippet_key}")\n'
                 "resp = client.chat.completions.create(\n"
                 f'    model="{model_id}",\n'
                 '    messages=[{"role": "user", "content": "Hello"}],\n'
@@ -443,17 +473,18 @@ class StudioRuntime:
             "cursor": (
                 f"Override OpenAI Base URL: {snippet_base}\n"
                 f"Model ID: {model_id}\n"
-                "API Key: EMPTY (or your Strata API key)"
+                f"API Key: {snippet_key}"
             ),
             "claude_code": (
                 f'export ANTHROPIC_BASE_URL="{root_snippet_base}"\n'
-                'export ANTHROPIC_AUTH_TOKEN="EMPTY"\n'
+                f'export ANTHROPIC_AUTH_TOKEN="{snippet_key}"\n'
                 f'export ANTHROPIC_MODEL="{model_id}"'
             ),
             "curl": (
                 f'curl -sS "{snippet_base}/chat/completions" \\\n'
                 '  -H "Content-Type: application/json" \\\n'
-                f'  -d \'{{"model":"{model_id}","messages":[{{"role":"user","content":"Hi"}}],"max_tokens":128}}\''
+                + (f'  -H "Authorization: Bearer {snippet_key}" \\\n' if snippet_key != "EMPTY" else "")
+                + f'  -d \'{{"model":"{model_id}","messages":[{{"role":"user","content":"Hi"}}],"max_tokens":128}}\''
             ),
         }
 
@@ -735,6 +766,15 @@ class StudioServer:
 
                     if path == "/api/studio/credentials":
                         creds = rt.config.save_credentials(body)
+                        upstream, kind, _ = rt.proxy.state.snapshot()
+                        if upstream or body.get("maya_api_key") or body.get("clear_maya_api_key") or body.get("strata_api_key") or body.get("clear_strata_api_key"):
+                            rt.proxy.set_upstream(
+                                upstream,
+                                engine_kind=kind,
+                                api_key=rt._resolve_engine_api_key(kind),
+                            )
+                            if upstream:
+                                rt.refresh_telemetry_now()
                         rt.logs.emit("system", "info", "已安全更新 ~/.config/maya-gcs/ 凭据 (chmod 0600)")
                         self._send_json(200, {"ok": True, "credentials": creds, "state": rt.build_state_payload()})
                         return

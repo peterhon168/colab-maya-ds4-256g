@@ -65,6 +65,26 @@ elif [ -n "${HF_TOKEN:-}" ]; then
   rm -f "$TMP_HF"
 fi
 
+# 可选公网 API 网关鉴权密钥 (保护 *.trycloudflare.com 不被未授权访问)
+MAYA_API_KEY_FILE_PATH=""
+if [ -n "${MAYA_API_KEY_FILE:-}" ] && [ -f "$MAYA_API_KEY_FILE" ]; then
+  MAYA_API_KEY_FILE_PATH="$MAYA_API_KEY_FILE"
+elif [ -f "$HOME/.config/maya-gcs/maya-api-key" ]; then
+  MAYA_API_KEY_FILE_PATH="$HOME/.config/maya-gcs/maya-api-key"
+elif [ -f "$RES_DIR/maya-api-key" ]; then
+  MAYA_API_KEY_FILE_PATH="$RES_DIR/maya-api-key"
+fi
+
+if [ -n "$MAYA_API_KEY_FILE_PATH" ]; then
+  colab upload -s "$SESSION" "$MAYA_API_KEY_FILE_PATH" /tmp/maya-api-key
+elif [ -n "${MAYA_API_KEY:-}" ]; then
+  TMP_API="/tmp/maya-api-key.$$"
+  umask 077
+  printf '%s' "$MAYA_API_KEY" > "$TMP_API"
+  colab upload -s "$SESSION" "$TMP_API" /tmp/maya-api-key
+  rm -f "$TMP_API"
+fi
+
 echo "[Mac] 正在启动远端自动拉取与部署流程..."
 colab exec -s "$SESSION" --timeout 1800 << 'EOF'
 !mkdir -p /content/project-maya

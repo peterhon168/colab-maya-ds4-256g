@@ -11,7 +11,7 @@ if [ "$SKILL_SRC" != "$TARGET_BASE" ]; then
   STASH_DIR=""
   if [ -d "$TARGET_BASE/resources" ]; then
     STASH_DIR="$(mktemp -d)"
-    for cred in gcs-key.json gcs-bucket hf-token; do
+    for cred in gcs-key.json gcs-bucket hf-token maya-api-key strata-api-key; do
       if [ -f "$TARGET_BASE/resources/$cred" ]; then
         cp -p "$TARGET_BASE/resources/$cred" "$STASH_DIR/$cred"
       fi
@@ -20,15 +20,16 @@ if [ "$SKILL_SRC" != "$TARGET_BASE" ]; then
 
   rm -rf "$TARGET_BASE"
   mkdir -p "$TARGET_BASE"
-  for item in SKILL.md README.md LICENSE docs resources scripts src; do
+  for item in .gitignore SKILL.md README.md README_EN.md LICENSE docs resources scripts src studio macos_app; do
     if [ -e "$SKILL_SRC/$item" ]; then
       cp -R "$SKILL_SRC/$item" "$TARGET_BASE/"
     fi
   done
+  find "$TARGET_BASE" \( -name "__pycache__" -o -name "*.pyc" \) -exec rm -rf {} + 2>/dev/null || true
 
   if [ -n "$STASH_DIR" ] && [ -d "$STASH_DIR" ]; then
     mkdir -p "$TARGET_BASE/resources"
-    for cred in gcs-key.json gcs-bucket hf-token; do
+    for cred in gcs-key.json gcs-bucket hf-token maya-api-key strata-api-key; do
       if [ -f "$STASH_DIR/$cred" ] && [ ! -f "$TARGET_BASE/resources/$cred" ]; then
         cp -p "$STASH_DIR/$cred" "$TARGET_BASE/resources/$cred"
         chmod 600 "$TARGET_BASE/resources/$cred"

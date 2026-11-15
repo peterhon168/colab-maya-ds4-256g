@@ -21,6 +21,8 @@ FORBIDDEN_FILENAMES = {
     "gcs-key.json",
     "gcs-bucket",
     "hf-token",
+    "maya-api-key",
+    "strata-api-key",
     ".env",
 }
 

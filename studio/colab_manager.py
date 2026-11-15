@@ -973,7 +973,9 @@ class ColabManager:
         self.refresh_auth_status(log_event=False)
 
         if tunnel_url:
-            api_key = self.config.read_credential_file("strata_api_key") if detected_kind == "strata" else ""
+            api_key = self.config.read_credential_file(
+                "strata_api_key" if detected_kind == "strata" else "maya_api_key"
+            )
             self.config.set_selection(
                 gpu=inferred_gpu,
                 session=sess,
@@ -1237,6 +1239,11 @@ class ColabManager:
                 if gcs_bucket.is_file():
                     self._upload_file(session, gcs_bucket, "/tmp/gcs-bucket")
 
+            maya_api_key = CONFIG_DIR / "maya-api-key"
+            has_maya_api_key = maya_api_key.is_file() and bool(self.config.read_credential_file("maya_api_key"))
+            if has_maya_api_key:
+                self._upload_file(session, maya_api_key, "/tmp/maya-api-key")
+
             # Step 3: Remote mount & engine startup
             self._set_deployment(phase="mounting", step_index=3, step_label="HF Xet / FUSE3 挂载与权重准备")
             cfg_settings = self.config.get_settings()
@@ -1248,10 +1255,12 @@ class ColabManager:
             clean_stale_gcs = (
                 "rm -f /tmp/gcs-key.json /tmp/gcs-bucket\n" if mode_id in ("b1_pure_hf", "b2_shm") else ""
             )
+            clean_stale_api = "" if has_maya_api_key else "rm -f /tmp/maya-api-key\n"
             remote_boot = (
                 "import os, subprocess, sys\n"
                 "cmd = '''set -euo pipefail\n"
                 f"{clean_stale_gcs}"
+                f"{clean_stale_api}"
                 "mkdir -p /content/project-maya\n"
                 "tar -xzf /tmp/maya-g4-runtime.tar.gz -C /content/project-maya/\n"
                 "cp -f /tmp/maya-ds4.json /content/project-maya/maya-ds4.json\n"

@@ -2,9 +2,12 @@
 resources/gcs-key.json
 resources/gcs-bucket
 resources/hf-token
+resources/maya-api-key
 gcs-key.json
 gcs-bucket
 hf-token
+maya-api-key
+*api-key*
 *.key
 *.pem
 *secret*

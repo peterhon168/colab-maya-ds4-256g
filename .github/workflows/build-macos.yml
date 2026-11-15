@@ -1,0 +1,78 @@
+name: Build & Audit Maya · Strata Studio (macOS)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  audit-and-build-macos:
+    name: Secret Audit & Universal MayaStudio.app
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run offline secret & tar hygiene audit
+        run: python3 scripts/audit_secrets.py
+
+      - name: Verify Python Studio syntax
+        run: python3 -m py_compile studio/__init__.py studio/__main__.py studio/config_store.py studio/colab_manager.py studio/engine_proxy.py studio/server.py scripts/audit_secrets.py
+
+      - name: Build Universal MayaStudio.app (arm64 + x86_64) & ZIP
+        run: |
+          bash macos_app/build_macos_app.sh --zip
+          codesign --verify --deep --strict MayaStudio.app
+          mv -f MayaStudio-macOS.zip MayaStudio-macOS-Universal.zip
+          ls -lh MayaStudio-macOS-Universal.zip
+          file MayaStudio.app/Contents/MacOS/MayaStudio
+
+      - name: Smoke-test embedded Studio backend
+        run: |
+          TMP_HOME="$(mktemp -d)"
+          PORT=18775
+          PROXY_PORT=18776
+          HOME="$TMP_HOME" PI_WEB_URL=off PYTHONPATH="MayaStudio.app/Contents/Resources" \
+            python3 -m studio --host 127.0.0.1 --port "$PORT" --proxy-port "$PROXY_PORT" > "$TMP_HOME/studio.log" 2>&1 &
+          PID=$!
+          trap 'kill "$PID" 2>/dev/null || true; rm -rf "$TMP_HOME"' EXIT
+          for _ in $(seq 1 20); do
+            if curl -fsS "http://127.0.0.1:${PORT}/api/studio/state" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.5
+          done
+          curl -fsS "http://127.0.0.1:${PORT}/api/studio/state" | python3 -c 'import json, sys; d = json.load(sys.stdin); assert d.get("ok") is True and len(d.get("modes_catalog", [])) == 5 and "has_maya_key" in d.get("credentials", {}), d; print("Studio /api/studio/state smoke test OK:", d["version"])'
+          FAV_CODE="$(curl -sS -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PORT}/favicon.ico")"
+          test "$FAV_CODE" = "200"
+          echo "Favicon HTTP status: $FAV_CODE"
+
+      - name: Upload MayaStudio-macOS-Universal.zip Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MayaStudio-macOS-Universal
+          path: MayaStudio-macOS-Universal.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach to GitHub Release (on tag push v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: MayaStudio-macOS-Universal.zip
+          generate_release_notes: true

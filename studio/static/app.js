@@ -163,6 +163,9 @@
       "modal.credTitle": "外部安全凭据设置 (~/.config/maya-gcs/)",
       "modal.credSecurityNote": "所有凭据仅以目录 0700 / 文件 0600 权限存储在本地 ~/.config/maya-gcs/，绝不会提交至仓库或暴露明文回显。留空项将保持原有文件不变。",
       "modal.pickJsonFile": "导入本地 .json",
+      "modal.mayaKeyLabel": "Maya 公网网关密钥 (maya-api-key)",
+      "modal.genMayaKey": "🎲 随机生成",
+      "modal.clearKey": "清空密钥",
       "modal.saveCreds": "安全保存凭据",
       "modal.guideTitle": "Maya · Strata Studio 快速接入指南",
     },
@@ -275,6 +278,9 @@
       "modal.credTitle": "External Credentials (~/.config/maya-gcs/)",
       "modal.credSecurityNote": "Stored locally in ~/.config/maya-gcs/ (0700 dir / 0600 files). Leave blank to keep existing values.",
       "modal.pickJsonFile": "Load .json",
+      "modal.mayaKeyLabel": "Maya Public Gateway Key (maya-api-key)",
+      "modal.genMayaKey": "🎲 Randomize",
+      "modal.clearKey": "Clear",
       "modal.saveCreds": "Save Securely",
       "modal.guideTitle": "Maya · Strata Studio Quick Guide",
     },
@@ -675,6 +681,8 @@
     const proxyRoot = !useLocal && activeUpstream ? activeUpstream.replace(/\/+$/, "") : getProxyBaseUrl(state);
     const modelId = state?.engine?.model_id || state?.settings?.strata_model || "deepseek-v4.1-flash-abliterated";
     const maxCtx = Number(state?.settings?.strata_max_context || state?.settings?.max_context || 262144);
+    const hasApiKey = Boolean(state?.engine?.has_api_key);
+    const apiKeyHint = !useLocal && hasApiKey ? "sk-maya-******" : "studio-local-proxy";
 
     const piJson = JSON.stringify(
       {
@@ -682,7 +690,7 @@
           "maya-studio": {
             baseUrl: openaiBase,
             api: "openai-completions",
-            apiKey: "studio-local-proxy",
+            apiKey: apiKeyHint,
             models: [
               {
                 id: modelId,
@@ -703,7 +711,7 @@
     const cursorJson = JSON.stringify(
       {
         "openai.baseUrl": openaiBase,
-        "openai.apiKey": "studio-local-proxy",
+        "openai.apiKey": apiKeyHint,
         "openai.model": modelId,
       },
       null,
@@ -712,7 +720,7 @@
 
     const claudeShell = [
       `export ANTHROPIC_BASE_URL="${proxyRoot}"`,
-      `export ANTHROPIC_AUTH_TOKEN="studio-local-proxy"`,
+      `export ANTHROPIC_AUTH_TOKEN="${apiKeyHint}"`,
       `export ANTHROPIC_MODEL="${modelId}"`,
     ].join("\n");
 
@@ -721,7 +729,7 @@
       "",
       "client = OpenAI(",
       `    base_url="${openaiBase}",`,
-      '    api_key="studio-local-proxy",',
+      `    api_key="${apiKeyHint}",`,
       ")",
       "resp = client.chat.completions.create(",
       `    model="${modelId}",`,
@@ -1023,6 +1031,8 @@
     if (bucketLabel) {
       bucketLabel.textContent = hasBucket ? `Bucket: ${maskBucket(creds.gcs_bucket)}` : "Bucket";
     }
+    $("dotMayaKey")?.classList.toggle("dot--green", Boolean(creds.has_maya_key));
+    $("dotMayaKey")?.classList.toggle("dot--muted", !creds.has_maya_key);
     $("dotStrataKey")?.classList.toggle("dot--green", Boolean(creds.has_strata_key));
     $("dotStrataKey")?.classList.toggle("dot--muted", !creds.has_strata_key);
 
@@ -1690,7 +1700,50 @@
     // Credentials Modal
     $("btnOpenCredentials")?.addEventListener("click", () => {
       setModalFeedback("credModalFeedback", "");
+      if ($("chkClearMayaKey")) $("chkClearMayaKey").checked = false;
       openModal("credentialsModal");
+    });
+
+    const generateRandomMayaKey = () => {
+      const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+      const bytes = new Uint8Array(32);
+      if (window.crypto && typeof window.crypto.getRandomValues === "function") {
+        window.crypto.getRandomValues(bytes);
+      } else {
+        for (let i = 0; i < bytes.length; i += 1) bytes[i] = Math.floor(Math.random() * 256);
+      }
+      let out = "sk-maya-";
+      for (let i = 0; i < bytes.length; i += 1) {
+        out += alphabet[bytes[i] % alphabet.length];
+      }
+      return out;
+    };
+
+    $("btnGenMayaKey")?.addEventListener("click", () => {
+      const key = generateRandomMayaKey();
+      if ($("credMayaKeyInput")) $("credMayaKeyInput").value = key;
+      if ($("chkClearMayaKey")) $("chkClearMayaKey").checked = false;
+      setModalFeedback(
+        "credModalFeedback",
+        ui.lang === "zh"
+          ? "已生成高强度随机网关密钥（已隐码填入），点击“安全保存凭据”写入 ~/.config/maya-gcs/maya-api-key"
+          : "Generated random gateway key; click Save Securely to persist."
+      );
+    });
+
+    $("btnCopyMayaKey")?.addEventListener("click", () => {
+      const val = $("credMayaKeyInput")?.value?.trim();
+      if (!val) {
+        showToast(ui.lang === "zh" ? "输入框为空，请先输入或点击“随机生成”" : "Input is empty", "warn");
+        return;
+      }
+      copyToClipboard(val, "Maya API Key");
+    });
+
+    $("chkClearMayaKey")?.addEventListener("change", (e) => {
+      if (e.target?.checked && $("credMayaKeyInput")) {
+        $("credMayaKeyInput").value = "";
+      }
     });
 
     $("credGcsKeyFile")?.addEventListener("change", async (e) => {
@@ -1713,10 +1766,17 @@
       const hfToken = $("credHfTokenInput")?.value?.trim();
       const bucket = $("credBucketInput")?.value?.trim();
       const gcsKey = $("credGcsKeyInput")?.value?.trim();
+      const mayaKey = $("credMayaKeyInput")?.value?.trim();
+      const clearMayaKey = Boolean($("chkClearMayaKey")?.checked);
       const strataKey = $("credStrataKeyInput")?.value?.trim();
       if (hfToken) payload.hf_token = hfToken;
       if (bucket) payload.gcs_bucket = bucket;
       if (gcsKey) payload.gcs_key_json = gcsKey;
+      if (clearMayaKey) {
+        payload.clear_maya_api_key = true;
+      } else if (mayaKey) {
+        payload.maya_api_key = mayaKey;
+      }
       if (strataKey) payload.strata_api_key = strataKey;
 
       if (Object.keys(payload).length === 0) {
@@ -1730,6 +1790,8 @@
         $("credHfTokenInput").value = "";
         $("credBucketInput").value = "";
         $("credGcsKeyInput").value = "";
+        if ($("credMayaKeyInput")) $("credMayaKeyInput").value = "";
+        if ($("chkClearMayaKey")) $("chkClearMayaKey").checked = false;
         $("credStrataKeyInput").value = "";
         await refreshStateNow();
         setModalFeedback("credModalFeedback", ui.lang === "zh" ? "凭据已按 0600 权限安全保存" : "Credentials saved securely");

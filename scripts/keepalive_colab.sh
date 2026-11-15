@@ -8,6 +8,7 @@ INTERVAL_SEC="${2:-720}" # 默认每 12 分钟向 Colab Jupyter Kernel 发送一
 PI_MODELS_JSON="${PI_MODELS_JSON:-$HOME/.pi/agent/models.json}"
 PI_PROVIDER_KEY="${PI_PROVIDER_KEY:-A100}"
 PI_WEB_URL="${PI_WEB_URL:-http://127.0.0.1:30141}"
+MAYA_API_KEY_FILE="${MAYA_API_KEY_FILE:-$HOME/.config/maya-gcs/maya-api-key}"
 
 echo "[keepalive] 已启动 Colab Session ($SESSION) 内核防休眠保活守护 (间隔: ${INTERVAL_SEC}s)..."
 
@@ -65,35 +66,44 @@ PY
     echo "[keepalive] 检测到 Cloudflare 隧道 URL: ${TUNNEL_URL}"
     if [ -f "$PI_MODELS_JSON" ]; then
       echo "[keepalive] 正在同步本地配置 ($PI_MODELS_JSON, provider=$PI_PROVIDER_KEY)..."
-      python3 - "$PI_MODELS_JSON" "$TUNNEL_URL" "$PI_PROVIDER_KEY" "$PI_WEB_URL" << 'PY' || true
-import json, sys, urllib.request
-path, url, pkey, web_url = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4].rstrip("/")
-with open(path, "r") as f:
+      python3 - "$PI_MODELS_JSON" "$TUNNEL_URL" "$PI_PROVIDER_KEY" "$PI_WEB_URL" "$MAYA_API_KEY_FILE" << 'PY' || true
+import json, os, sys, urllib.request
+path, url, pkey, web_url, api_key_file = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4].rstrip("/"), sys.argv[5]
+api_key = ""
+if api_key_file and os.path.isfile(api_key_file):
+    try:
+        api_key = open(api_key_file, "r", encoding="utf-8").read().strip()
+    except OSError:
+        api_key = ""
+with open(path, "r", encoding="utf-8") as f:
     cfg = json.load(f)
 if "providers" in cfg and pkey in cfg["providers"]:
     cfg["providers"][pkey]["baseUrl"] = f"{url}/v1"
+    if api_key:
+        cfg["providers"][pkey]["apiKey"] = api_key
     for m in cfg["providers"][pkey].get("models", []):
         m["maxTokens"] = max(int(m.get("maxTokens") or 0), 65536)
         if "image" not in m.get("input", []):
             m["input"] = ["text", "image"]
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
     if web_url:
         try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
             req = urllib.request.Request(
                 f"{web_url}/api/models-config",
-                data=json.dumps(cfg).encode(),
+                data=json.dumps(cfg).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
                 method="PUT",
             )
-            urllib.request.urlopen(req, timeout=5).read()
+            opener.open(req, timeout=5).read()
             req2 = urllib.request.Request(
                 f"{web_url}/api/models/refresh",
                 data=b"{}",
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            urllib.request.urlopen(req2, timeout=5).read()
+            opener.open(req2, timeout=5).read()
         except Exception:
             pass
 PY

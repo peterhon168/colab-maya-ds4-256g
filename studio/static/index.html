@@ -302,6 +302,7 @@
               <span class="cred-pill"><span id="dotHfToken" class="dot dot--muted"></span>HF Token</span>
               <span class="cred-pill"><span id="dotGcsKey" class="dot dot--muted"></span>GCS Key</span>
               <span class="cred-pill"><span id="dotBucket" class="dot dot--muted"></span><span id="credBucketLabel">Bucket</span></span>
+              <span class="cred-pill"><span id="dotMayaKey" class="dot dot--muted"></span>Maya Key</span>
               <span class="cred-pill"><span id="dotStrataKey" class="dot dot--muted"></span>Strata Key</span>
             </div>
           </button>
@@ -727,6 +728,20 @@
             </label>
           </div>
           <textarea id="credGcsKeyInput" class="textarea-input mono masked-textarea" rows="3" placeholder="粘贴 Service Account JSON 内容或点击右上角导入文件（已遮蔽防录屏泄露）" autocomplete="off" spellcheck="false"></textarea>
+        </div>
+        <div class="field-group">
+          <div class="field-label-row">
+            <label for="credMayaKeyInput" class="field-label" data-i18n="modal.mayaKeyLabel">Maya 公网网关密钥 (maya-api-key)</label>
+            <div class="cred-inline-actions">
+              <button id="btnGenMayaKey" class="btn btn--ghost btn--xs" type="button" data-i18n="modal.genMayaKey">🎲 随机生成</button>
+              <button id="btnCopyMayaKey" class="btn btn--ghost btn--xs" type="button" data-i18n="common.copy">复制</button>
+              <label class="checkbox-inline checkbox-inline--xs">
+                <input id="chkClearMayaKey" type="checkbox">
+                <span data-i18n="modal.clearKey">清空密钥</span>
+              </label>
+            </div>
+          </div>
+          <input id="credMayaKeyInput" class="text-input mono" type="password" placeholder="可选：保护公网 *.trycloudflare.com 与 /v1/* 接口（留空保持不变）" autocomplete="new-password">
         </div>
         <div class="field-group">
           <label for="credStrataKeyInput" class="field-label">Strata API Key (strata-api-key)</label>

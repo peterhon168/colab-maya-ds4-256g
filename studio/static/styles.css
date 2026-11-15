@@ -2207,6 +2207,19 @@ body.shell-macos .topbar {
 }
 
 /* Responsive fallback for narrow viewports */
+.cred-inline-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.checkbox-inline--xs {
+  font-size: 11px;
+  gap: 5px;
+  color: var(--text-secondary);
+}
+
 @media (max-width: 1140px) {
   html,
   body {

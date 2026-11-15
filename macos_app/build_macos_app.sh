@@ -71,6 +71,8 @@ FORBIDDEN_EXACT = {
     "gcs-key.json",
     "gcs-bucket",
     "hf-token",
+    "maya-api-key",
+    "strata-api-key",
     ".env",
     ".DS_Store",
     "__MACOSX",
@@ -78,6 +80,7 @@ FORBIDDEN_EXACT = {
 }
 
 FORBIDDEN_GLOBS = (
+    "*api-key*",
     "*.key",
     "*.pem",
     "*secret*",
@@ -129,7 +132,7 @@ for folder in ("studio", "scripts", "src", "resources"):
     else:
         print(f"[build] Embedded {folder}/ ({copied} clean files)")
 
-for top_doc in ("LICENSE", "README.md", "SKILL.md"):
+for top_doc in ("LICENSE", "README.md", "README_EN.md", "SKILL.md"):
     p = src_root / top_doc
     if p.is_file():
         shutil.copy2(p, res_root / top_doc)
@@ -140,7 +143,7 @@ if [ -d "${RESOURCES_DIR}/scripts" ]; then
 fi
 
 # Double-check zero secret files exist inside the bundle
-for forbidden in "gcs-key.json" "gcs-bucket" "hf-token" ".env"; do
+for forbidden in "gcs-key.json" "gcs-bucket" "hf-token" "maya-api-key" "strata-api-key" ".env"; do
     if find "${BUNDLE_DIR}" -name "${forbidden}" -print -quit | grep -q .; then
         echo "[build] ERROR: Forbidden credential file '${forbidden}' detected inside ${BUNDLE_DIR}!" >&2
         exit 1
