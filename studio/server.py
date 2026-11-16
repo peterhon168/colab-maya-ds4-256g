@@ -195,6 +195,8 @@ class StudioRuntime:
         )
         with self._tel_lock:
             self._telemetry = snap
+        if snap.get("online") and (kind == "strata" or snap.get("loaded")):
+            self.colab.mark_warming_ready_if_idle_deploy()
         return snap
 
     def get_telemetry_snapshot(self) -> dict[str, Any]:

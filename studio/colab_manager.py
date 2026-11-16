@@ -691,6 +691,19 @@ def _parse_maya_warmup_lines(lines: list[str], ram_track: dict[str, float]) -> d
     return None
 
 
+def _is_health_ready(health: Any) -> bool:
+    if not isinstance(health, dict) or not health:
+        return False
+    if bool(health.get("unloaded")):
+        return False
+    if isinstance(health.get("loaded"), bool):
+        return bool(health["loaded"])
+    if health.get("ok") is True:
+        return True
+    st = str(health.get("status") or "").strip().lower()
+    return st in ("ok", "ready", "healthy", "loaded", "idle", "busy", "generating")
+
+
 class ColabManager:
     """Coordinates Colab OAuth, G4-safe VM provisioning, non-destructive attach, keepalive & exec."""
 
@@ -857,6 +870,22 @@ class ColabManager:
             if started_at is not None and phase not in ("idle", "ready", "error"):
                 snap["elapsed_sec"] = int(max(0.0, time.time() - float(started_at)))
             return snap
+
+    def mark_warming_ready_if_idle_deploy(self) -> None:
+        """Promote attached warming state to ready once telemetry confirms engine is loaded."""
+        with self._lock:
+            deploy_busy = self._deploy_thread is not None and self._deploy_thread.is_alive()
+            phase = str(self._deployment.get("phase") or "")
+        if not deploy_busy and phase == "warming":
+            self._set_deployment(
+                phase="ready",
+                step_index=6,
+                step_label="部署完成，引擎在线",
+                percent=100.0,
+                sub_percent=100.0,
+                detail="云端引擎已就绪在线",
+                eta_text="已完成",
+            )
 
     def _set_deployment(
         self,
@@ -1117,14 +1146,16 @@ class ColabManager:
                 upstream_url=tunnel_url,
             )
             self.proxy.set_upstream(tunnel_url, engine_kind=detected_kind, api_key=api_key)
-            if self.on_telemetry_refresh is not None:
-                self.on_telemetry_refresh()
+            tel = self.on_telemetry_refresh() if self.on_telemetry_refresh is not None else {}
             with self._lock:
                 deploy_busy = self._deploy_thread is not None and self._deploy_thread.is_alive()
             if not deploy_busy:
                 local_health = probe.get("local_health") if isinstance(probe.get("local_health"), dict) else {}
                 maya_tail = probe.get("maya_log_tail") if isinstance(probe.get("maya_log_tail"), list) else []
-                if local_health.get("ok") or local_health.get("loaded"):
+                tel_ready = isinstance(tel, dict) and bool(tel.get("online")) and (
+                    detected_kind == "strata" or bool(tel.get("loaded"))
+                )
+                if _is_health_ready(local_health) or tel_ready:
                     self._set_deployment(
                         phase="ready",
                         step_index=6,
