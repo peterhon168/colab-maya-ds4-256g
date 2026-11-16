@@ -638,8 +638,13 @@
 
     const summary = $("deployStatusSummary");
     if (summary) {
-      if (deployment?.step_label) {
+      if (engineOnline) {
+        summary.textContent = deployment?.step_label || t("status.online");
+      } else if (deployment?.step_label && deployment.step_label !== "部署完成，引擎在线") {
         summary.textContent = deployment.step_label;
+      } else if (isDeploying) {
+        summary.textContent =
+          ui.lang === "zh" ? "隧道已连通 · 正在等待远端引擎完成权重装入..." : "Tunnel connected · Loading weights into VRAM/RAM...";
       } else {
         summary.textContent = t("deploy.idleSummary");
       }
@@ -657,8 +662,8 @@
 
     grid.innerHTML = "";
     DEPLOY_STEPS.forEach((item) => {
-      const done = engineOnline || (stepIndex > item.step) || (stepIndex === 6 && !deployment?.error);
-      const active = !done && isDeploying && stepIndex === item.step;
+      const done = engineOnline || (stepIndex > item.step) || (item.step < 6 && stepIndex === 6 && !deployment?.error);
+      const active = !done && !deployment?.error && (stepIndex === item.step);
       const el = document.createElement("div");
       el.className = `step-item${done ? " is-done" : ""}${active ? " is-active" : ""}`;
       el.innerHTML = `
@@ -878,14 +883,18 @@
     const pill = $("topStatusPill");
     const pillText = $("topStatusText");
     const isDeploying = !engine.online && Number(deploy.step_index || 0) > 0 && !deploy.error;
+    const hasUpstream = Boolean(engine.upstream_url);
     if (pill && pillText) {
       pill.classList.remove("status-pill--online", "status-pill--loading", "status-pill--offline");
-      if (engine.online) {
+      if (engine.online && engine.loaded !== false) {
         pill.classList.add("status-pill--online");
         pillText.textContent = t("status.online");
-      } else if (isDeploying) {
+      } else if (isDeploying || hasUpstream || (engine.online && engine.loaded === false)) {
         pill.classList.add("status-pill--loading");
-        pillText.textContent = deploy.step_label || t("status.loading");
+        const fallbackWarm =
+          ui.lang === "zh" ? "隧道已通 · 权重装入显存中..." : "Tunnel up · Loading weights...";
+        const lbl = deploy.step_label && deploy.step_label !== "部署完成，引擎在线" ? deploy.step_label : fallbackWarm;
+        pillText.textContent = lbl;
       } else {
         pill.classList.add("status-pill--offline");
         pillText.textContent = t("status.standby");
@@ -1367,15 +1376,22 @@
     // Topbar actions
     $("btnOpenGuide")?.addEventListener("click", () => openModal("guideModal"));
 
-    $("btnOpenExternalWebui")?.addEventListener("click", () => {
+    const openProxyExternal = () => {
+      if (!ui.lastState?.engine?.online) {
+        showToast(
+          ui.lang === "zh"
+            ? "远端权重仍在装入中，新窗口就绪后将每 5 秒自动刷新进入控制台"
+            : "Engine warming up; tab will auto-refresh every 5s",
+          "warn"
+        );
+      }
       const url = `${getProxyBaseUrl()}/`;
       window.open(url, "_blank", "noopener");
-    });
+    };
 
-    $("btnFallbackNewTab")?.addEventListener("click", () => {
-      const url = `${getProxyBaseUrl()}/`;
-      window.open(url, "_blank", "noopener");
-    });
+    $("btnOpenExternalWebui")?.addEventListener("click", openProxyExternal);
+
+    $("btnFallbackNewTab")?.addEventListener("click", openProxyExternal);
 
     $("btnLangToggle")?.addEventListener("click", () => {
       ui.lang = ui.lang === "zh" ? "en" : "zh";

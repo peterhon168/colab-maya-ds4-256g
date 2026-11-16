@@ -219,6 +219,51 @@ def _bad_gateway_html(err_msg: str) -> bytes:
     return html.encode("utf-8")
 
 
+def _warming_up_html(status_code: int, studio_port: int, detail: str = "") -> bytes:
+    safe_detail = (
+        detail.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    )
+    extra = f'<p class="detail">诊断信息：{safe_detail}</p>' if safe_detail else ""
+    html = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="refresh" content="5" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>引擎加载中 · Maya · Strata Studio</title>
+  <style>
+    body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0b0f17; color: #e2e8f0;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif; padding: 24px; }}
+    .box {{ max-width: 560px; background: #111826; border: 1px solid rgba(245,158,11,.35); border-radius: 14px; padding: 26px 28px; box-shadow: 0 20px 50px rgba(0,0,0,.45); }}
+    .badge {{ display: inline-flex; align-items: center; gap: 8px; font-size: 12px; color: #fbbf24;
+      background: rgba(245,158,11,.12); border: 1px solid rgba(245,158,11,.28); border-radius: 999px; padding: 4px 10px; margin-bottom: 14px; }}
+    h2 {{ margin: 0 0 10px; font-size: 18px; color: #f8fafc; }}
+    p {{ margin: 0 0 12px; font-size: 13.5px; color: #94a3b8; line-height: 1.65; word-break: break-word; }}
+    .detail {{ font-size: 12px; color: #64748b; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
+    .actions {{ display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }}
+    a, button {{ font: inherit; font-size: 13px; padding: 8px 14px; border-radius: 8px; text-decoration: none; cursor: pointer; }}
+    .primary {{ background: #2563eb; color: #fff; border: 1px solid #3b82f6; }}
+    .secondary {{ background: rgba(148,163,184,.12); color: #e2e8f0; border: 1px solid rgba(148,163,184,.22); }}
+  </style>
+</head>
+<body>
+  <main class="box">
+    <div class="badge">⏳ 云端权重预热中 · 每 5 秒自动刷新</div>
+    <h2>云端推理引擎正在装入权重 (HTTP {status_code})</h2>
+    <p>Cloudflare 隧道已连通，远端 <code>maya-ds4</code> / <code>Strata</code> 正在将 748B 模型专家权重流式装入显存与系统内存（冷启动通常需要 10~22 分钟，全部装入后才会监听 <code>127.0.0.1:8000</code>）。</p>
+    <p>本页面每 <strong>5 秒</strong>自动刷新检测，就绪后会自动进入原生对话控制台；无需手动重复点击开机。</p>
+    {extra}
+    <div class="actions">
+      <a class="primary" href="http://127.0.0.1:{studio_port}" target="_top">返回 Maya · Strata Studio 查看实时加载进度</a>
+      <button class="secondary" type="button" onclick="location.reload()">立即刷新检测</button>
+    </div>
+  </main>
+</body>
+</html>
+"""
+    return html.encode("utf-8")
+
+
 class ProxyState:
     """Thread-safe upstream target configuration for the reverse proxy and telemetry client."""
 
@@ -379,6 +424,51 @@ class EngineProxyServer:
                 if self.command != "HEAD":
                     self.wfile.write(STUDIO_FAVICON_SVG)
 
+            def _send_warming_response(
+                self,
+                *,
+                status_code: int,
+                is_v1: bool,
+                path_only: str,
+                err_detail: str = "",
+            ) -> None:
+                accept = (self.headers.get("Accept") or "").lower()
+                wants_html = (
+                    not is_v1
+                    and self.command in ("GET", "HEAD")
+                    and path_only in ("/", "/index.html")
+                    and ("text/html" in accept or "*/*" in accept or not accept)
+                )
+                if wants_html:
+                    body = _warming_up_html(status_code, studio_port, err_detail)
+                    self.send_response(503)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Retry-After", "5")
+                    self.end_headers()
+                    if self.command != "HEAD":
+                        self.wfile.write(body)
+                    return
+
+                msg = (
+                    f"远端推理引擎正在将权重装入显存/内存（隧道已通，:8000 尚未监听，HTTP {status_code}），请稍候 1~3 分钟再试。"
+                    if not err_detail
+                    else f"远端引擎尚未就绪或不可达: {err_detail}"
+                )
+                self._send_json(
+                    503,
+                    {
+                        "ok": False,
+                        "error": {
+                            "type": "engine_warming_up",
+                            "code": "engine_warming_up",
+                            "message": msg,
+                        },
+                    },
+                    is_v1=is_v1,
+                )
+
             def _handle_unconfigured(self, path_only: str) -> None:
                 is_v1 = path_only.startswith("/v1/")
                 if self.command == "OPTIONS" and is_v1:
@@ -484,19 +574,11 @@ class EngineProxyServer:
                         self.send_header("Content-Length", "0")
                         self.end_headers()
                         return
-                    accept = (self.headers.get("Accept") or "").lower()
-                    if self.command == "GET" and path_only in ("/", "/index.html") and "text/html" in accept:
-                        body = _bad_gateway_html(str(exc))
-                        self.send_response(502)
-                        self.send_header("Content-Type", "text/html; charset=utf-8")
-                        self.send_header("Content-Length", str(len(body)))
-                        self.end_headers()
-                        self.wfile.write(body)
-                        return
-                    self._send_json(
-                        502,
-                        {"ok": False, "error": {"type": "upstream_unreachable", "message": str(exc)}},
+                    self._send_warming_response(
+                        status_code=502,
                         is_v1=is_v1,
+                        path_only=path_only,
+                        err_detail=str(exc),
                     )
                     return
 
@@ -532,6 +614,16 @@ class EngineProxyServer:
                                 resp_cl = None
                         elif hkl == "transfer-encoding" and "chunked" in hv.lower():
                             is_chunked = True
+
+                    if resp.status in (502, 503, 504, 521, 522, 524, 530) and "text/html" in resp_ct:
+                        resp.read()
+                        proxy_state.record_status(resp.status, f"Upstream warming up (HTTP {resp.status})")
+                        self._send_warming_response(
+                            status_code=resp.status,
+                            is_v1=is_v1,
+                            path_only=path_only,
+                        )
+                        return
 
                     is_stream = (
                         "text/event-stream" in resp_ct

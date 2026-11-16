@@ -1288,7 +1288,7 @@ class ColabManager:
             if engine_kind == "strata":
                 self._launch_strata_on_colab(session, cfg_settings)
 
-            # Step 5: Tunnel extraction
+            # Step 5: Tunnel extraction & keepalive
             self._set_deployment(phase="tunneling", step_index=5, step_label="提取 Cloudflare 隧道地址")
             self.logs.emit("deploy", "info", "[5/6] 正在等待并提取隧道 URL...")
             tunnel_url = ""
@@ -1302,14 +1302,71 @@ class ColabManager:
             if not tunnel_url:
                 raise RuntimeError("未检测到 Cloudflare 隧道 URL，请检查远端 cloudflared.log")
 
-            # Step 6: Bind proxy & keepalive
-            self._set_deployment(phase="syncing", step_index=6, step_label="绑定同源代理与保活守护")
+            # Step 6: Bind proxy, start keepalive & wait for full weight load into VRAM/RAM
+            self._set_deployment(phase="warming", step_index=6, step_label="隧道已连通，正在将权重装入显存与内存...")
             self.keepalive(enabled=True, session=session, interval_sec=720)
+            self._wait_for_engine_ready(session=session, tunnel_url=tunnel_url, engine_kind=engine_kind)
+            if self.on_telemetry_refresh is not None:
+                self.on_telemetry_refresh()
             self._set_deployment(phase="ready", step_index=6, step_label="部署完成，引擎在线")
-            self.logs.emit("deploy", "success", "[6/6] 部署流程完成，网关与保活已就绪")
+            self.logs.emit("deploy", "success", "[6/6] 引擎权重加载完毕，WebUI 与 /v1 推理接口已正式上线！")
         except Exception as exc:
             self._set_deployment(phase="error", step_index=0, step_label="部署失败", error=str(exc))
             self.logs.emit("deploy", "error", f"部署异常: {exc}")
+
+    def _wait_for_engine_ready(self, *, session: str, tunnel_url: str, engine_kind: str) -> None:
+        """Wait until the remote engine finishes loading experts into VRAM/RAM and serves :8000."""
+        self.logs.emit("deploy", "info", "[6/6] 隧道已建立，正在等待远端引擎完成权重装入并监听 :8000...")
+        api_key = self.config.read_credential_file("strata_api_key" if engine_kind == "strata" else "maya_api_key")
+        deadline = time.monotonic() + 2400.0
+        last_log_check = 0.0
+        last_label = ""
+        log_probe_py = (
+            "from pathlib import Path\n"
+            "p = Path('/content/project-maya/maya-ds4.log')\n"
+            "if p.is_file():\n"
+            "    print('\\n'.join(p.read_text(errors='replace').splitlines()[-40:]))\n"
+        )
+
+        while time.monotonic() < deadline:
+            tel = fetch_engine_telemetry(tunnel_url, engine_kind=engine_kind, api_key=api_key, timeout=4.0)
+            if tel.get("online") and (engine_kind == "strata" or tel.get("loaded")):
+                return
+
+            now = time.monotonic()
+            if engine_kind == "maya" and self.colab_bin and (now - last_log_check >= 20.0):
+                last_log_check = now
+                rc, out, _ = self._run_bounded(
+                    [self.colab_bin, "exec", "-s", session, "--timeout", "15"],
+                    stdin_data=log_probe_py,
+                    timeout=20.0,
+                )
+                label = ""
+                if rc == 0 and out:
+                    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+                    for ln in reversed(lines):
+                        m_ram = re.search(r"ds4:\s*copying experts\s*(\d+)\s*/\s*(\d+)\s*\(([^)]+)\)", ln)
+                        if m_ram:
+                            label = f"正在装入 RAM 专家权重: {m_ram.group(1)}/{m_ram.group(2)} ({m_ram.group(3)})"
+                            break
+                        m_vram = re.search(r"ds4:\s*experts\s*(\d+)\s*/\s*(\d+)\s*\(([^)]+)\)", ln)
+                        if m_vram:
+                            label = f"正在装入 VRAM 专家权重: {m_vram.group(1)}/{m_vram.group(2)} ({m_vram.group(3)})"
+                            break
+                        m_start = re.search(r"\[maya\]\s*still starting\s*\((\d+)\s*s\)", ln)
+                        if m_start:
+                            label = f"引擎正在加载权重与初始化 ({m_start.group(1)}s)..."
+                            break
+                if not label and tel.get("online"):
+                    label = "引擎端口 :8000 已监听，正在完成最终权重初始化..."
+                if label and label != last_label:
+                    last_label = label
+                    self._set_deployment(phase="warming", step_index=6, step_label=label)
+                    self.logs.emit("deploy", "info", f"[6/6] {label}")
+
+            time.sleep(5.0)
+
+        raise RuntimeError("等待远端引擎加载权重超时 (40m)，请查看远端 maya-ds4.log")
 
     def _launch_strata_on_colab(self, session: str, settings: dict[str, Any]) -> None:
         """Start Strata mode via serve/server.py --engine strata when requested on Colab."""
