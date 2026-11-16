@@ -128,6 +128,7 @@ class StudioRuntime:
             proxy=self.proxy,
             on_telemetry_refresh=self.refresh_telemetry_now,
         )
+        self.proxy.deployment_getter = self.colab.get_deployment_snapshot
 
         self._tel_lock = threading.RLock()
         self._telemetry: dict[str, Any] = {

@@ -13,7 +13,7 @@ import ssl
 import threading
 import time
 import urllib.parse
-from typing import Any
+from typing import Any, Callable
 
 from .config_store import STUDIO_FAVICON_SVG, LogBroker
 
@@ -219,27 +219,52 @@ def _bad_gateway_html(err_msg: str) -> bytes:
     return html.encode("utf-8")
 
 
-def _warming_up_html(status_code: int, studio_port: int, detail: str = "") -> bytes:
-    safe_detail = (
-        detail.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    )
-    extra = f'<p class="detail">诊断信息：{safe_detail}</p>' if safe_detail else ""
+def _warming_up_html(
+    status_code: int,
+    studio_port: int,
+    detail: str = "",
+    deployment: dict[str, Any] | None = None,
+) -> bytes:
+    def _esc(val: Any) -> str:
+        return str(val or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    dep = deployment or {}
+    pct = float(dep.get("percent") or 0.0)
+    pct = max(0.0, min(100.0, pct))
+    step_idx = int(dep.get("step_index") or 6)
+    step_label = str(dep.get("step_label") or "正在将 748B 专家权重流式装入显存与系统内存...")
+    dep_detail = str(dep.get("detail") or detail or "")
+    eta_text = str(dep.get("eta_text") or "权重装载阶段预计 ~14–18 分钟")
+    elapsed_sec = int(dep.get("elapsed_sec") or 0)
+    elapsed_str = ""
+    if elapsed_sec > 0:
+        m, s = divmod(elapsed_sec, 60)
+        elapsed_str = f"已用时 {m:02d}:{s:02d} · "
+
+    pct_label = f"{pct:.1f}%" if pct > 0 else "准备中"
+    extra = f'<p class="detail">{_esc(dep_detail)}</p>' if dep_detail else ""
     html = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
   <meta http-equiv="refresh" content="5" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>引擎加载中 · Maya · Strata Studio</title>
+  <title>引擎加载中 ({_esc(pct_label)}) · Maya · Strata Studio</title>
   <style>
     body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0b0f17; color: #e2e8f0;
       font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif; padding: 24px; }}
-    .box {{ max-width: 560px; background: #111826; border: 1px solid rgba(245,158,11,.35); border-radius: 14px; padding: 26px 28px; box-shadow: 0 20px 50px rgba(0,0,0,.45); }}
+    .box {{ max-width: 560px; width: 100%; background: #111826; border: 1px solid rgba(245,158,11,.35); border-radius: 14px; padding: 26px 28px; box-shadow: 0 20px 50px rgba(0,0,0,.45); }}
     .badge {{ display: inline-flex; align-items: center; gap: 8px; font-size: 12px; color: #fbbf24;
       background: rgba(245,158,11,.12); border: 1px solid rgba(245,158,11,.28); border-radius: 999px; padding: 4px 10px; margin-bottom: 14px; }}
     h2 {{ margin: 0 0 10px; font-size: 18px; color: #f8fafc; }}
     p {{ margin: 0 0 12px; font-size: 13.5px; color: #94a3b8; line-height: 1.65; word-break: break-word; }}
-    .detail {{ font-size: 12px; color: #64748b; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
+    .prog-card {{ background: rgba(15,23,42,.85); border: 1px solid rgba(148,163,184,.2); border-radius: 10px; padding: 12px 14px; margin: 14px 0; }}
+    .prog-head {{ display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 13px; font-weight: 600; color: #f1f5f9; }}
+    .prog-pct {{ color: #60a5fa; font-variant-numeric: tabular-nums; }}
+    .prog-track {{ width: 100%; height: 8px; border-radius: 999px; background: rgba(148,163,184,.16); overflow: hidden; }}
+    .prog-fill {{ height: 100%; border-radius: 999px; background: linear-gradient(90deg, #2563eb, #10b981); transition: width .35s ease; }}
+    .prog-eta {{ margin-top: 8px; font-size: 12px; color: #93c5fd; font-variant-numeric: tabular-nums; }}
+    .detail {{ font-size: 12px; color: #94a3b8; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin-top: 6px; margin-bottom: 0; }}
     .actions {{ display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }}
     a, button {{ font: inherit; font-size: 13px; padding: 8px 14px; border-radius: 8px; text-decoration: none; cursor: pointer; }}
     .primary {{ background: #2563eb; color: #fff; border: 1px solid #3b82f6; }}
@@ -250,11 +275,18 @@ def _warming_up_html(status_code: int, studio_port: int, detail: str = "") -> by
   <main class="box">
     <div class="badge">⏳ 云端权重预热中 · 每 5 秒自动刷新</div>
     <h2>云端推理引擎正在装入权重 (HTTP {status_code})</h2>
-    <p>Cloudflare 隧道已连通，远端 <code>maya-ds4</code> / <code>Strata</code> 正在将 748B 模型专家权重流式装入显存与系统内存（冷启动通常需要 10~22 分钟，全部装入后才会监听 <code>127.0.0.1:8000</code>）。</p>
-    <p>本页面每 <strong>5 秒</strong>自动刷新检测，就绪后会自动进入原生对话控制台；无需手动重复点击开机。</p>
-    {extra}
+    <div class="prog-card">
+      <div class="prog-head">
+        <span>[{step_idx}/6] {_esc(step_label)}</span>
+        <span class="prog-pct">{_esc(pct_label)}</span>
+      </div>
+      <div class="prog-track"><div class="prog-fill" style="width: {max(4.0, pct):.1f}%;"></div></div>
+      <div class="prog-eta">{_esc(elapsed_str)}{_esc(eta_text)}</div>
+      {extra}
+    </div>
+    <p>Cloudflare 隧道已连通，远端 <code>maya-ds4</code> / <code>Strata</code> 将在全部专家装入显存与系统内存后立即监听 <code>127.0.0.1:8000</code>；本页每 <strong>5 秒</strong>自动刷新并跳转进入原生对话控制台。</p>
     <div class="actions">
-      <a class="primary" href="http://127.0.0.1:{studio_port}" target="_top">返回 Maya · Strata Studio 查看实时加载进度</a>
+      <a class="primary" href="http://127.0.0.1:{studio_port}" target="_top">返回 Maya · Strata Studio 查看实时日志与进度</a>
       <button class="secondary" type="button" onclick="location.reload()">立即刷新检测</button>
     </div>
   </main>
@@ -326,11 +358,13 @@ class EngineProxyServer:
         initial_upstream: str = "",
         initial_kind: str = "maya",
         initial_api_key: str = "",
+        deployment_getter: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         self.host = host
         self.proxy_port = proxy_port
         self.studio_port = studio_port
         self.logs = logs
+        self.deployment_getter = deployment_getter
         self.state = ProxyState(studio_port=studio_port, proxy_port=proxy_port)
         if initial_upstream:
             self.state.set_upstream(
@@ -356,6 +390,7 @@ class EngineProxyServer:
         proxy_state = self.state
         studio_port = self.studio_port
         proxy_port = self.proxy_port
+        proxy_server = self
 
         class ProxyHandler(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -440,7 +475,13 @@ class EngineProxyServer:
                     and ("text/html" in accept or "*/*" in accept or not accept)
                 )
                 if wants_html:
-                    body = _warming_up_html(status_code, studio_port, err_detail)
+                    dep_snap: dict[str, Any] | None = None
+                    if proxy_server.deployment_getter is not None:
+                        try:
+                            dep_snap = proxy_server.deployment_getter()
+                        except Exception:
+                            dep_snap = None
+                    body = _warming_up_html(status_code, studio_port, err_detail, dep_snap)
                     self.send_response(503)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.send_header("Content-Length", str(len(body)))

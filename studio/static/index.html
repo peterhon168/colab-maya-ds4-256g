@@ -388,11 +388,19 @@
                       当前未连接到在线引擎。你可以启动全新 Colab 部署、无损纳管运行中的实例，或接入局域网/远端 Strata 节点。
                     </p>
                   </div>
-                  <span id="deployStepCounter" class="step-counter tabular-nums">0 / 6</span>
+                  <div class="pipeline-header-badges">
+                    <span id="deployPercentBadge" class="pct-badge tabular-nums">0%</span>
+                    <span id="deployStepCounter" class="step-counter tabular-nums">0 / 6</span>
+                  </div>
                 </div>
 
                 <div class="pipeline-progress-track">
                   <div id="deployProgressBar" class="pipeline-progress-fill" style="width: 0%;"></div>
+                </div>
+
+                <div class="pipeline-meta-row">
+                  <span id="deployDetailText" class="pipeline-detail-text mono-ellipsis">首次冷启预计总耗时 ~22–28 分钟（分片拉取 ~9m + 显存/内存装载 ~15m）</span>
+                  <span id="deployEtaText" class="pipeline-eta-text tabular-nums">--</span>
                 </div>
 
                 <div id="deployStepsGrid" class="pipeline-steps">
@@ -588,6 +596,21 @@
             <div id="sseStatusBadge" class="sse-badge sse-badge--connecting">
               <span class="dot dot--amber"></span>
               <span id="sseStatusText" data-i18n="logs.connecting">连接中</span>
+            </div>
+          </div>
+
+          <!-- Real-Time Deployment & Weight Warmup Progress Card -->
+          <div id="rightDeployProgressCard" class="right-progress-card hidden" aria-live="polite">
+            <div class="right-progress-top">
+              <span id="rightProgressTitle" class="right-progress-title mono-ellipsis">准备部署...</span>
+              <span id="rightProgressPct" class="right-progress-pct tabular-nums">0%</span>
+            </div>
+            <div class="right-progress-track">
+              <div id="rightProgressFill" class="right-progress-fill" style="width: 0%;"></div>
+            </div>
+            <div class="right-progress-meta">
+              <span id="rightProgressDetail" class="right-progress-detail mono-ellipsis">--</span>
+              <span id="rightProgressEta" class="right-progress-eta tabular-nums">--</span>
             </div>
           </div>
 

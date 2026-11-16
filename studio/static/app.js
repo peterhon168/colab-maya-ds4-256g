@@ -45,12 +45,12 @@
   ];
 
   const DEPLOY_STEPS = [
-    { step: 1, zh: "分配 GPU", en: "Provision GPU", sub_zh: "校验机型规格与会话", sub_en: "Check GPU shape & session" },
-    { step: 2, zh: "上传运行包", en: "Upload Runtime", sub_zh: "推送预编译产物与元数据", sub_en: "Push runtime & pack meta" },
-    { step: 3, zh: "HF Xet / FUSE3 挂载", en: "Mount Storage", sub_zh: "准备分片与零冷启通道", sub_en: "Prepare shards & FUSE3" },
-    { step: 4, zh: "编译与启动服务", en: "Compile & Boot", sub_zh: "加载引擎与 CUDA/CPU 通道", sub_en: "Load engine & lanes" },
-    { step: 5, zh: "建立隧道", en: "Start Tunnel", sub_zh: "启动 cloudflared 公网隧道", sub_en: "Expose tunnel URL" },
-    { step: 6, zh: "同步网关", en: "Sync Gateway", sub_zh: "绑定 127.0.0.1:18766", sub_en: "Bind local proxy 18766" },
+    { step: 1, zh: "分配 GPU", en: "Provision GPU", sub_zh: "校验机型与会话 (~10–30s)", sub_en: "GPU shape (~10–30s)" },
+    { step: 2, zh: "上传运行包", en: "Upload Runtime", sub_zh: "推送包与凭据 (~15–30s)", sub_en: "Upload bundle (~15–30s)" },
+    { step: 3, zh: "HF Xet 拉取分片", en: "Pull NVMe Shards", sub_zh: "NVMe 分片+FUSE3 (~8–11m)", sub_en: "Shards + FUSE3 (~8–11m)" },
+    { step: 4, zh: "编译与启动服务", en: "Compile & Boot", sub_zh: "编译预读库与拉起 (~15–30s)", sub_en: "Compile & boot (~15–30s)" },
+    { step: 5, zh: "建立隧道", en: "Start Tunnel", sub_zh: "cloudflared 隧道 (~5–10s)", sub_en: "Tunnel URL (~5–10s)" },
+    { step: 6, zh: "权重装入显存/内存", en: "Load Weights & Sync", sub_zh: "VRAM+RAM 专家装载 (~12–18m)", sub_en: "VRAM+RAM load (~12–18m)" },
   ];
 
   const I18N = {
@@ -307,6 +307,9 @@
     lastState: null,
     hydratedFromServer: false,
     dirtyInputs: new Set(),
+    elapsedAnchorSec: 0,
+    elapsedAnchorMs: 0,
+    elapsedTicker: null,
     currentIframeSrc: "",
     currentUpstreamKey: "",
     pollTimer: null,
@@ -622,19 +625,80 @@
     $("strataModePanel")?.classList.toggle("hidden", isMaya);
   }
 
+  function formatElapsed(sec) {
+    const total = Math.max(0, Math.floor(Number(sec) || 0));
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    const pad = (n) => String(n).padStart(2, "0");
+    return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
+  }
+
+  function getLiveElapsedSec(deployment, engineOnline) {
+    const base = Number(deployment?.elapsed_sec || 0);
+    const phase = String(deployment?.phase || "idle").toLowerCase();
+    if (!engineOnline && phase !== "idle" && phase !== "ready" && phase !== "error" && ui.elapsedAnchorMs > 0) {
+      return ui.elapsedAnchorSec + Math.floor((Date.now() - ui.elapsedAnchorMs) / 1000);
+    }
+    return base;
+  }
+
+  function resolveDeployPercent(deployment, engineOnline, stepIndex) {
+    if (engineOnline) return 100;
+    if (typeof deployment?.percent === "number" && Number.isFinite(deployment.percent)) {
+      return Math.max(0, Math.min(100, deployment.percent));
+    }
+    return Math.round((stepIndex / 6) * 100);
+  }
+
+  function buildEtaSummary(deployment, engineOnline) {
+    const elapsed = getLiveElapsedSec(deployment, engineOnline);
+    const elapsedPart = elapsed > 0 ? `${ui.lang === "zh" ? "已用" : "Elapsed"} ${formatElapsed(elapsed)}` : "";
+    const etaRaw = String(deployment?.eta_text || "").trim();
+    if (elapsedPart && etaRaw) return `${elapsedPart} · ${etaRaw}`;
+    return etaRaw || elapsedPart || (engineOnline ? (ui.lang === "zh" ? "已就绪" : "Ready") : "--");
+  }
+
   function renderDeploySteps(deployment, engineOnline) {
     const grid = $("deployStepsGrid");
     if (!grid) return;
     const rawIndex = Number(deployment?.step_index || 0);
     const stepIndex = engineOnline ? 6 : Math.max(0, Math.min(6, rawIndex));
     const phase = String(deployment?.phase || "idle").toLowerCase();
-    const isDeploying = !engineOnline && (phase === "deploying" || phase === "running" || stepIndex > 0 && !deployment?.error);
+    const isDeploying = !engineOnline && phase !== "idle" && phase !== "ready" && phase !== "error" && stepIndex > 0 && !deployment?.error;
+    const pct = resolveDeployPercent(deployment, engineOnline, stepIndex);
+    const pctStr = `${pct.toFixed(pct > 0 && pct < 100 ? 1 : 0)}%`;
 
     const counter = $("deployStepCounter");
     if (counter) counter.textContent = `${stepIndex} / 6`;
 
+    const pctBadge = $("deployPercentBadge");
+    if (pctBadge) pctBadge.textContent = pctStr;
+
     const bar = $("deployProgressBar");
-    if (bar) bar.style.width = `${Math.round((stepIndex / 6) * 100)}%`;
+    if (bar) {
+      bar.style.width = `${pct}%`;
+      bar.classList.toggle("is-active", !engineOnline && pct > 0 && !deployment?.error);
+    }
+
+    const detailEl = $("deployDetailText");
+    if (detailEl) {
+      if (deployment?.error) {
+        detailEl.textContent = deployment.error;
+      } else if (deployment?.detail) {
+        detailEl.textContent = deployment.detail;
+      } else {
+        detailEl.textContent =
+          ui.lang === "zh"
+            ? "首次冷启预计总耗时 ~22–28 分钟（分片拉取 ~9m + 显存/内存装载 ~15m）"
+            : "Typical cold boot takes ~22–28m (shard download ~9m + VRAM/RAM load ~15m)";
+      }
+    }
+
+    const etaEl = $("deployEtaText");
+    if (etaEl) {
+      etaEl.textContent = buildEtaSummary(deployment, engineOnline);
+    }
 
     const summary = $("deployStatusSummary");
     if (summary) {
@@ -664,6 +728,7 @@
     DEPLOY_STEPS.forEach((item) => {
       const done = engineOnline || (stepIndex > item.step) || (item.step < 6 && stepIndex === 6 && !deployment?.error);
       const active = !done && !deployment?.error && (stepIndex === item.step);
+      const subPct = active && typeof deployment?.sub_percent === "number" ? Math.max(0, Math.min(100, deployment.sub_percent)) : null;
       const el = document.createElement("div");
       el.className = `step-item${done ? " is-done" : ""}${active ? " is-active" : ""}`;
       el.innerHTML = `
@@ -671,10 +736,83 @@
         <span class="step-label-wrap">
           <span class="step-name">${escapeHtml(ui.lang === "zh" ? item.zh : item.en)}</span>
           <span class="step-sub">${escapeHtml(ui.lang === "zh" ? item.sub_zh : item.sub_en)}</span>
+          ${subPct !== null ? `<span class="step-sub-bar"><span class="step-sub-fill" style="width:${subPct.toFixed(1)}%"></span></span>` : ""}
         </span>
       `;
       grid.appendChild(el);
     });
+  }
+
+  function renderRightProgressCard(state) {
+    const card = $("rightDeployProgressCard");
+    if (!card) return;
+    const engine = state?.engine || {};
+    const deploy = state?.deployment || {};
+    const engineOnline = Boolean(engine.online) && engine.loaded !== false;
+    const stepIndex = Number(deploy.step_index || 0);
+    const phase = String(deploy.phase || "idle").toLowerCase();
+    const isActive = !engineOnline && (phase !== "idle" && phase !== "ready" && phase !== "error" ? true : Boolean(engine.upstream_url));
+    const isError = !engineOnline && Boolean(deploy.error);
+
+    if (!engineOnline && !isActive && !isError) {
+      card.classList.add("hidden");
+      card.classList.remove("is-ready", "is-error");
+      return;
+    }
+
+    card.classList.remove("hidden");
+    card.classList.toggle("is-ready", engineOnline);
+    card.classList.toggle("is-error", isError);
+
+    const pct = isError ? resolveDeployPercent(deploy, false, stepIndex) : resolveDeployPercent(deploy, engineOnline, stepIndex || 6);
+    const pctStr = `${pct.toFixed(pct > 0 && pct < 100 ? 1 : 0)}%`;
+
+    const titleEl = $("rightProgressTitle");
+    const pctEl = $("rightProgressPct");
+    const fillEl = $("rightProgressFill");
+    const detailEl = $("rightProgressDetail");
+    const etaEl = $("rightProgressEta");
+
+    if (engineOnline) {
+      if (titleEl) titleEl.textContent = ui.lang === "zh" ? "✓ 推理引擎已全部装载就绪" : "✓ Inference Engine Loaded & Ready";
+      if (pctEl) pctEl.textContent = "100%";
+      if (fillEl) {
+        fillEl.style.width = "100%";
+        fillEl.classList.remove("is-active");
+      }
+      if (detailEl) {
+        const modelStr = engine.model_id || "deepseek-v4.1-flash-abliterated";
+        detailEl.textContent = `${modelStr} · VRAM + RAM 常驻`;
+      }
+      if (etaEl) {
+        const elap = Number(deploy.elapsed_sec || 0);
+        etaEl.textContent = elap > 0 ? `${ui.lang === "zh" ? "耗时" : "Took"} ${formatElapsed(elap)}` : (ui.lang === "zh" ? "随时可调用" : "Ready");
+      }
+      return;
+    }
+
+    if (isError) {
+      if (titleEl) titleEl.textContent = ui.lang === "zh" ? "✕ 部署或启动中断" : "✕ Deployment Interrupted";
+      if (pctEl) pctEl.textContent = pctStr;
+      if (fillEl) {
+        fillEl.style.width = `${Math.max(4, pct)}%`;
+        fillEl.classList.remove("is-active");
+      }
+      if (detailEl) detailEl.textContent = deploy.error || "--";
+      if (etaEl) etaEl.textContent = buildEtaSummary(deploy, false);
+      return;
+    }
+
+    const fallbackWarm = ui.lang === "zh" ? "隧道已连通 · 正在将权重装入显存与内存..." : "Tunnel up · Loading weights into VRAM/RAM...";
+    const lbl = deploy.step_label && deploy.step_label !== "部署完成，引擎在线" ? deploy.step_label : fallbackWarm;
+    if (titleEl) titleEl.textContent = `[${stepIndex || 6}/6] ${lbl}`;
+    if (pctEl) pctEl.textContent = pctStr;
+    if (fillEl) {
+      fillEl.style.width = `${Math.max(2, pct)}%`;
+      fillEl.classList.add("is-active");
+    }
+    if (detailEl) detailEl.textContent = deploy.detail || (ui.lang === "zh" ? "等待远端心跳..." : "Polling remote node...");
+    if (etaEl) etaEl.textContent = buildEtaSummary(deploy, false);
   }
 
   function renderSnippets(state) {
@@ -851,6 +989,9 @@
     const settings = state.settings || {};
     const telemetry = engine.telemetry || {};
 
+    ui.elapsedAnchorSec = Number(deploy.elapsed_sec || 0);
+    ui.elapsedAnchorMs = Date.now();
+
     // Hydrate user choices once on first poll
     if (!ui.hydratedFromServer) {
       if (colab.selected_gpu) ui.selectedGpu = String(colab.selected_gpu).toLowerCase();
@@ -891,10 +1032,12 @@
         pillText.textContent = t("status.online");
       } else if (isDeploying || hasUpstream || (engine.online && engine.loaded === false)) {
         pill.classList.add("status-pill--loading");
+        const pct = resolveDeployPercent(deploy, false, Number(deploy.step_index || 0));
+        const pctPrefix = pct > 0 ? `[${pct.toFixed(pct < 100 ? 1 : 0)}%] ` : "";
         const fallbackWarm =
           ui.lang === "zh" ? "隧道已通 · 权重装入显存中..." : "Tunnel up · Loading weights...";
         const lbl = deploy.step_label && deploy.step_label !== "部署完成，引擎在线" ? deploy.step_label : fallbackWarm;
-        pillText.textContent = lbl;
+        pillText.textContent = `${pctPrefix}${lbl}`;
       } else {
         pill.classList.add("status-pill--offline");
         pillText.textContent = t("status.standby");
@@ -1073,9 +1216,10 @@
       }
     }
 
-    // Center Tab 1: Iframe vs Pipeline
+    // Center Tab 1: Iframe vs Pipeline & Right Progress Card
     updateIframeVisibility(state);
-    renderDeploySteps(deploy, Boolean(engine.online));
+    renderDeploySteps(deploy, Boolean(engine.online) && engine.loaded !== false);
+    renderRightProgressCard(state);
 
     // Center Tab 2: Telemetry KPIs & Recent Requests
     const setKpi = (id, val, suffix = "") => {
@@ -1275,8 +1419,10 @@
 
   function scheduleNextPoll() {
     if (ui.pollTimer) clearTimeout(ui.pollTimer);
-    const phase = String(ui.lastState?.deployment?.phase || "").toLowerCase();
-    const interval = phase === "deploying" || phase === "running" ? 2000 : 3500;
+    const dep = ui.lastState?.deployment || {};
+    const phase = String(dep.phase || "").toLowerCase();
+    const active = Number(dep.step_index || 0) > 0 && phase !== "idle" && phase !== "ready" && phase !== "error";
+    const interval = active ? 2000 : 3500;
     ui.pollTimer = setTimeout(pollStateOnce, interval);
   }
 
@@ -2067,6 +2213,21 @@
     renderDeploySteps({}, false);
     renderSnippets(null);
     bindEvents();
+
+    if (!ui.elapsedTicker) {
+      ui.elapsedTicker = setInterval(() => {
+        if (!ui.lastState) return;
+        const eng = ui.lastState.engine || {};
+        const dep = ui.lastState.deployment || {};
+        const engReady = Boolean(eng.online) && eng.loaded !== false;
+        const ph = String(dep.phase || "idle").toLowerCase();
+        if (!engReady && ph !== "idle" && ph !== "ready" && ph !== "error") {
+          const text = buildEtaSummary(dep, false);
+          if ($("deployEtaText")) $("deployEtaText").textContent = text;
+          if ($("rightProgressEta")) $("rightProgressEta").textContent = text;
+        }
+      }, 1000);
+    }
 
     await pollStateOnce();
     await loadInitialLogs();

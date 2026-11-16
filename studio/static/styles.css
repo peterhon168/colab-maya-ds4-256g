@@ -1382,6 +1382,24 @@ body.shell-macos .topbar {
   color: var(--text-secondary);
 }
 
+.pipeline-header-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.pct-badge {
+  padding: 4px 10px;
+  border-radius: var(--radius-pill);
+  background: rgba(16, 185, 129, 0.14);
+  border: 1px solid rgba(16, 185, 129, 0.35);
+  color: #6EE7B7;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
 .step-counter {
   padding: 4px 10px;
   border-radius: var(--radius-pill);
@@ -1395,7 +1413,7 @@ body.shell-macos .topbar {
 
 .pipeline-progress-track {
   width: 100%;
-  height: 6px;
+  height: 7px;
   border-radius: 999px;
   background: rgba(148, 163, 184, 0.14);
   overflow: hidden;
@@ -1406,6 +1424,151 @@ body.shell-macos .topbar {
   border-radius: 999px;
   background: linear-gradient(90deg, #2563EB, #10B981);
   transition: width 0.35s ease;
+}
+
+.pipeline-progress-fill.is-active,
+.right-progress-fill.is-active {
+  background: linear-gradient(90deg, #2563EB, #38BDF8, #10B981);
+  background-size: 200% 100%;
+  animation: progressShimmer 2.2s linear infinite;
+}
+
+@keyframes progressShimmer {
+  0% { background-position: 100% 0; }
+  100% { background-position: -100% 0; }
+}
+
+.pipeline-meta-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+
+.pipeline-detail-text {
+  min-width: 0;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.pipeline-eta-text {
+  flex-shrink: 0;
+  color: #93C5FD;
+  font-weight: 600;
+}
+
+.step-sub-bar {
+  margin-top: 5px;
+  width: 100%;
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.16);
+  overflow: hidden;
+}
+
+.step-sub-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: #60A5FA;
+  transition: width 0.3s ease;
+}
+
+/* Right Column Live Progress Card */
+.right-progress-card {
+  flex-shrink: 0;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: linear-gradient(180deg, rgba(37, 99, 235, 0.11), rgba(15, 23, 42, 0.55));
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.right-progress-card.is-ready {
+  background: linear-gradient(180deg, rgba(16, 185, 129, 0.1), rgba(15, 23, 42, 0.45));
+}
+
+.right-progress-card.is-error {
+  background: linear-gradient(180deg, rgba(239, 68, 68, 0.12), rgba(15, 23, 42, 0.55));
+}
+
+.right-progress-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.right-progress-title {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  min-width: 0;
+}
+
+.right-progress-pct {
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: #93C5FD;
+}
+
+.right-progress-card.is-ready .right-progress-pct {
+  color: #6EE7B7;
+}
+
+.right-progress-card.is-error .right-progress-pct {
+  color: #FCA5A5;
+}
+
+.right-progress-track {
+  width: 100%;
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.16);
+  overflow: hidden;
+}
+
+.right-progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #2563EB, #10B981);
+  transition: width 0.35s ease;
+}
+
+.right-progress-card.is-ready .right-progress-fill {
+  background: var(--accent-emerald);
+}
+
+.right-progress-card.is-error .right-progress-fill {
+  background: #EF4444;
+}
+
+.right-progress-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 10.5px;
+}
+
+.right-progress-detail {
+  min-width: 0;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+}
+
+.right-progress-eta {
+  flex-shrink: 0;
+  color: #FCD34D;
+  font-weight: 600;
+}
+
+.right-progress-card.is-ready .right-progress-eta {
+  color: #6EE7B7;
 }
 
 .pipeline-steps {

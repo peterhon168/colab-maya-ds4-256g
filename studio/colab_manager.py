@@ -409,6 +409,7 @@ result = {
     },
     "tunnel_url": "",
     "local_health": None,
+    "maya_log_tail": [],
 }
 
 try:
@@ -511,6 +512,13 @@ for port in (8000, 18181):
     except Exception:
         pass
 
+if os.path.isfile("/content/project-maya/maya-ds4.log"):
+    try:
+        with open("/content/project-maya/maya-ds4.log", "r", encoding="utf-8", errors="replace") as mf:
+            result["maya_log_tail"] = [ln.rstrip() for ln in mf.readlines()[-30:]]
+    except Exception:
+        pass
+
 print("STUDIO_PROBE_JSON:" + json.dumps(result, ensure_ascii=False))
 '''
 
@@ -608,6 +616,81 @@ def _discover_colab_toolchain() -> tuple[str | None, str | None]:
     return colab_bin, colab_python
 
 
+def _fmt_duration(seconds: float) -> str:
+    sec = max(0, int(round(seconds)))
+    if sec < 60:
+        return f"{max(1, sec)}s"
+    if sec < 3600:
+        m, s = divmod(sec, 60)
+        return f"{m}m {s:02d}s"
+    h, rem = divmod(sec, 3600)
+    return f"{h}h {rem // 60:02d}m"
+
+
+def _parse_maya_warmup_lines(lines: list[str], ram_track: dict[str, float]) -> dict[str, Any] | None:
+    """Parse latest VRAM/RAM expert loading or initialization progress from maya-ds4.log."""
+    for ln in reversed(lines):
+        s = (ln or "").strip()
+        if not s:
+            continue
+        m_ram = re.search(r"ds4:\s*copying experts\s*(\d+)\s*/\s*(\d+)\s*\(([^)]+)\)", s)
+        if m_ram:
+            x = int(m_ram.group(1))
+            y = max(1, int(m_ram.group(2)))
+            info = m_ram.group(3)
+            frac = min(1.0, x / y)
+            pct = round(74.0 + 25.0 * frac, 1)
+            sub_pct = round(100.0 * frac, 1)
+            now = time.monotonic()
+            if "x0" not in ram_track:
+                ram_track["x0"] = float(x)
+                ram_track["t0"] = now
+            dt = now - ram_track.get("t0", now)
+            dx = x - ram_track.get("x0", float(x))
+            if dx > 0 and dt > 3.0:
+                rate = dx / dt
+                rem_s = max(5.0, (y - x) / rate + 15.0)
+            else:
+                rem_s = max(10.0, (1.0 - frac) * 620.0 + 15.0)
+            return {
+                "percent": pct,
+                "sub_percent": sub_pct,
+                "label": f"正在装入 RAM 专家权重 ({sub_pct:.0f}%)",
+                "detail": f"RAM 专家: {x:,} / {y:,} ({info})",
+                "eta_text": f"预计剩余 ~{_fmt_duration(rem_s)}",
+            }
+
+        m_vram = re.search(r"ds4:\s*experts\s*(\d+)\s*/\s*(\d+)\s*\(([^)]+)\)", s)
+        if m_vram:
+            x = int(m_vram.group(1))
+            y = max(1, int(m_vram.group(2)))
+            info = m_vram.group(3)
+            frac = min(1.0, x / y)
+            pct = round(59.0 + 15.0 * frac, 1)
+            sub_pct = round(100.0 * frac, 1)
+            rem_s = max(15.0, (1.0 - frac) * 260.0 + 580.0)
+            return {
+                "percent": pct,
+                "sub_percent": sub_pct,
+                "label": f"正在装入 VRAM 专家权重 ({sub_pct:.0f}%)",
+                "detail": f"VRAM 专家: {x:,} / {y:,} ({info})",
+                "eta_text": f"VRAM 装入中 · 预计总剩余 ~{_fmt_duration(rem_s)}",
+            }
+
+        m_start = re.search(r"\[maya\]\s*still starting\s*\((\d+)\s*s\)", s)
+        if m_start:
+            sec = int(m_start.group(1))
+            pct = round(min(58.8, 56.0 + sec / 65.0), 1)
+            return {
+                "percent": pct,
+                "sub_percent": None,
+                "label": f"引擎正在初始化与校验分片 ({sec}s)...",
+                "detail": "校验 GGUF 索引并分配 96GB 显存空间",
+                "eta_text": "权重装载阶段预计 ~14–18 分钟",
+            }
+    return None
+
+
 class ColabManager:
     """Coordinates Colab OAuth, G4-safe VM provisioning, non-destructive attach, keepalive & exec."""
 
@@ -645,6 +728,12 @@ class ColabManager:
             "step_index": 0,
             "step_total": 6,
             "step_label": "",
+            "percent": 0.0,
+            "sub_percent": None,
+            "detail": "",
+            "eta_text": "",
+            "started_at": None,
+            "elapsed_sec": 0,
             "error": "",
         }
         self._deploy_thread: threading.Thread | None = None
@@ -762,15 +851,60 @@ class ColabManager:
 
     def get_deployment_snapshot(self) -> dict[str, Any]:
         with self._lock:
-            return dict(self._deployment)
+            snap = dict(self._deployment)
+            started_at = snap.get("started_at")
+            phase = str(snap.get("phase") or "idle")
+            if started_at is not None and phase not in ("idle", "ready", "error"):
+                snap["elapsed_sec"] = int(max(0.0, time.time() - float(started_at)))
+            return snap
 
-    def _set_deployment(self, *, phase: str, step_index: int, step_label: str, error: str = "") -> None:
+    def _set_deployment(
+        self,
+        *,
+        phase: str,
+        step_index: int,
+        step_label: str,
+        percent: float | None = None,
+        sub_percent: float | None = None,
+        detail: str | None = None,
+        eta_text: str | None = None,
+        error: str = "",
+        reset_timer: bool = False,
+    ) -> None:
         with self._lock:
+            prev = self._deployment
+            now = time.time()
+            if reset_timer:
+                started_at: float | None = now
+                elapsed_sec = 0
+                prev_pct = 0.0
+            else:
+                started_at = prev.get("started_at")
+                if started_at is None and phase not in ("idle",):
+                    started_at = now
+                elapsed_sec = int(max(0.0, now - float(started_at))) if started_at is not None else int(prev.get("elapsed_sec") or 0)
+                prev_pct = float(prev.get("percent") or 0.0)
+
+            if phase == "idle":
+                next_pct = 0.0
+            elif percent is None:
+                next_pct = prev_pct
+            elif phase == "error":
+                next_pct = round(float(percent), 1)
+            else:
+                next_pct = max(prev_pct, min(100.0, round(float(percent), 1)))
+
             self._deployment = {
                 "phase": phase,
                 "step_index": step_index,
                 "step_total": 6,
                 "step_label": step_label,
+                "percent": next_pct,
+                "sub_percent": None if sub_percent is None else max(0.0, min(100.0, round(float(sub_percent), 1))),
+                "detail": prev.get("detail", "") if detail is None else detail,
+                "eta_text": prev.get("eta_text", "") if eta_text is None else eta_text,
+                "started_at": started_at,
+                "elapsed_sec": elapsed_sec,
                 "error": error,
             }
 
@@ -985,6 +1119,42 @@ class ColabManager:
             self.proxy.set_upstream(tunnel_url, engine_kind=detected_kind, api_key=api_key)
             if self.on_telemetry_refresh is not None:
                 self.on_telemetry_refresh()
+            with self._lock:
+                deploy_busy = self._deploy_thread is not None and self._deploy_thread.is_alive()
+            if not deploy_busy:
+                local_health = probe.get("local_health") if isinstance(probe.get("local_health"), dict) else {}
+                maya_tail = probe.get("maya_log_tail") if isinstance(probe.get("maya_log_tail"), list) else []
+                if local_health.get("ok") or local_health.get("loaded"):
+                    self._set_deployment(
+                        phase="ready",
+                        step_index=6,
+                        step_label="部署完成，引擎在线",
+                        percent=100.0,
+                        sub_percent=100.0,
+                        detail="云端引擎已就绪在线",
+                        eta_text="已完成",
+                    )
+                elif processes.get("maya_alive") and maya_tail:
+                    parsed_warm = _parse_maya_warmup_lines([str(x) for x in maya_tail], {})
+                    if parsed_warm:
+                        self._set_deployment(
+                            phase="warming",
+                            step_index=6,
+                            step_label=parsed_warm["label"],
+                            percent=parsed_warm["percent"],
+                            sub_percent=parsed_warm["sub_percent"],
+                            detail=parsed_warm["detail"],
+                            eta_text=parsed_warm["eta_text"],
+                        )
+                    else:
+                        self._set_deployment(
+                            phase="warming",
+                            step_index=6,
+                            step_label="隧道已连通 · 正在等待权重装载...",
+                            percent=56.0,
+                            detail="远端引擎已启动，等待开放 :8000",
+                            eta_text="权重装载阶段预计 ~14–18 分钟",
+                        )
             self.logs.emit(
                 "colab",
                 "success",
@@ -1157,7 +1327,16 @@ class ColabManager:
             self.config.update_settings(settings)
         self.config.set_selection(gpu=gpu_clean, session=sess, engine_kind=kind, maya_mode=mode_id)
 
-        self._set_deployment(phase="allocating", step_index=1, step_label="分配与校验 Colab GPU 实例")
+        self._set_deployment(
+            phase="provisioning",
+            step_index=1,
+            step_label="分配与校验 Colab GPU 实例",
+            percent=2.0,
+            sub_percent=None,
+            detail=f"请求 {gpu_clean} 实例规格",
+            eta_text="本步预计 ~10–30 秒 · 首次冷启全程约 22–28 分钟",
+            reset_timer=True,
+        )
         self._deploy_thread = threading.Thread(
             target=self._deploy_worker,
             args=(gpu_clean, sess, kind, mode_id),
@@ -1201,7 +1380,15 @@ class ColabManager:
                 raise RuntimeError("未检测到 colab CLI 或 colab_cli 运行环境")
 
             # Step 2: Upload runtime packages & credentials from ~/.config/maya-gcs/
-            self._set_deployment(phase="uploading", step_index=2, step_label="上传预编译运行包与安全凭据")
+            self._set_deployment(
+                phase="uploading",
+                step_index=2,
+                step_label="上传预编译运行包与安全凭据",
+                percent=6.0,
+                sub_percent=0.0,
+                detail="准备上传运行包与加速源码...",
+                eta_text="本步预计 ~15–30 秒",
+            )
             self.logs.emit("deploy", "info", "[2/6] 正在上传运行包与脚本至 /tmp...")
 
             res_dir = REPO_ROOT / "resources"
@@ -1221,9 +1408,19 @@ class ColabManager:
                 if cp.is_file():
                     uploads.append((cp, f"/tmp/{cname}"))
 
-            for local_p, remote_p in uploads:
+            total_uploads = len(uploads)
+            for idx, (local_p, remote_p) in enumerate(uploads, start=1):
                 if not local_p.is_file():
                     raise RuntimeError(f"缺少部署资源文件: {local_p.name}")
+                self._set_deployment(
+                    phase="uploading",
+                    step_index=2,
+                    step_label="上传预编译运行包与安全凭据",
+                    percent=round(6.0 + 6.0 * (idx / max(1, total_uploads)), 1),
+                    sub_percent=round(100.0 * idx / max(1, total_uploads), 1),
+                    detail=f"上传组件 ({idx}/{total_uploads}): {local_p.name}",
+                    eta_text="本步预计 ~15–30 秒",
+                )
                 self._upload_file(session, local_p, remote_p)
 
             # Upload credentials from ~/.config/maya-gcs/ (respecting pure-hf / shm mode isolation)
@@ -1244,8 +1441,16 @@ class ColabManager:
             if has_maya_api_key:
                 self._upload_file(session, maya_api_key, "/tmp/maya-api-key")
 
-            # Step 3: Remote mount & engine startup
-            self._set_deployment(phase="mounting", step_index=3, step_label="HF Xet / FUSE3 挂载与权重准备")
+            # Step 3 & 4: Detached remote execution with live log & shard-download telemetry streaming
+            self._set_deployment(
+                phase="mounting",
+                step_index=3,
+                step_label="准备运行环境与挂载 /mnt/hf FUSE3",
+                percent=14.0,
+                sub_percent=None,
+                detail="启动远端部署守护并初始化环境...",
+                eta_text="环境挂载预计 ~1–2 分钟 · 全程约 22–28 分钟",
+            )
             cfg_settings = self.config.get_settings()
             script_env = resolve_mode_env(mode_id, cfg_settings, for_script=True)
             env_exports = " ".join(f"{k}={shlex_quote(v)}" for k, v in script_env.items())
@@ -1256,40 +1461,27 @@ class ColabManager:
                 "rm -f /tmp/gcs-key.json /tmp/gcs-bucket\n" if mode_id in ("b1_pure_hf", "b2_shm") else ""
             )
             clean_stale_api = "" if has_maya_api_key else "rm -f /tmp/maya-api-key\n"
-            remote_boot = (
-                "import os, subprocess, sys\n"
-                "cmd = '''set -euo pipefail\n"
-                f"{clean_stale_gcs}"
-                f"{clean_stale_api}"
-                "mkdir -p /content/project-maya\n"
-                "tar -xzf /tmp/maya-g4-runtime.tar.gz -C /content/project-maya/\n"
-                "cp -f /tmp/maya-ds4.json /content/project-maya/maya-ds4.json\n"
-                "cp -f /tmp/pack-meta-256g.tar.gz /content/project-maya/pack-meta-256g.tar.gz\n"
-                "chmod +x /tmp/start_g4_256g.sh\n"
-                f"env {env_exports} bash /tmp/start_g4_256g.sh\n"
-                "'''\n"
-                "p = subprocess.run(['bash', '-lc', cmd], text=True)\n"
-                "sys.exit(p.returncode)\n"
+            self._run_remote_boot_streaming(
+                session=session,
+                mode_id=mode_id,
+                env_exports=env_exports,
+                clean_stale_gcs=clean_stale_gcs,
+                clean_stale_api=clean_stale_api,
             )
-
-            self._set_deployment(phase="starting", step_index=4, step_label="编译加速库并启动推理引擎")
-            rc, out, err = self._run_bounded(
-                [self.colab_bin, "exec", "-s", session, "--timeout", "1800"],
-                stdin_data=remote_boot,
-                timeout=1830.0,
-            )
-            if out:
-                for ln in out.splitlines()[-25:]:
-                    if ln.strip():
-                        self.logs.emit("deploy", "info", ln.strip())
-            if rc != 0:
-                raise RuntimeError((err or out).strip()[-400:] or f"远端启动脚本退出码 {rc}")
 
             if engine_kind == "strata":
                 self._launch_strata_on_colab(session, cfg_settings)
 
             # Step 5: Tunnel extraction & keepalive
-            self._set_deployment(phase="tunneling", step_index=5, step_label="提取 Cloudflare 隧道地址")
+            self._set_deployment(
+                phase="tunneling",
+                step_index=5,
+                step_label="建立 Cloudflare 隧道与启动保活",
+                percent=54.0,
+                sub_percent=None,
+                detail="提取 *.trycloudflare.com 并启动 12m 保活",
+                eta_text="预计 ~5–10 秒",
+            )
             self.logs.emit("deploy", "info", "[5/6] 正在等待并提取隧道 URL...")
             tunnel_url = ""
             for _ in range(18):
@@ -1303,16 +1495,246 @@ class ColabManager:
                 raise RuntimeError("未检测到 Cloudflare 隧道 URL，请检查远端 cloudflared.log")
 
             # Step 6: Bind proxy, start keepalive & wait for full weight load into VRAM/RAM
-            self._set_deployment(phase="warming", step_index=6, step_label="隧道已连通，正在将权重装入显存与内存...")
+            self._set_deployment(
+                phase="warming",
+                step_index=6,
+                step_label="隧道已连通，正在将权重装入显存与内存...",
+                percent=56.0,
+                sub_percent=0.0,
+                detail="正在初始化 GGUF 索引并流式装载 748B 专家...",
+                eta_text="权重装载阶段预计 ~14–18 分钟",
+            )
             self.keepalive(enabled=True, session=session, interval_sec=720)
             self._wait_for_engine_ready(session=session, tunnel_url=tunnel_url, engine_kind=engine_kind)
             if self.on_telemetry_refresh is not None:
                 self.on_telemetry_refresh()
-            self._set_deployment(phase="ready", step_index=6, step_label="部署完成，引擎在线")
+            self._set_deployment(
+                phase="ready",
+                step_index=6,
+                step_label="部署完成，引擎在线",
+                percent=100.0,
+                sub_percent=100.0,
+                detail="96GB VRAM + 系统内存专家池已全部就绪",
+                eta_text="已完成",
+            )
             self.logs.emit("deploy", "success", "[6/6] 引擎权重加载完毕，WebUI 与 /v1 推理接口已正式上线！")
         except Exception as exc:
-            self._set_deployment(phase="error", step_index=0, step_label="部署失败", error=str(exc))
+            self._set_deployment(
+                phase="error",
+                step_index=0,
+                step_label="部署失败",
+                detail=str(exc),
+                eta_text="已中止",
+                error=str(exc),
+            )
             self.logs.emit("deploy", "error", f"部署异常: {exc}")
+
+    def _run_remote_boot_streaming(
+        self,
+        *,
+        session: str,
+        mode_id: str,
+        env_exports: str,
+        clean_stale_gcs: str,
+        clean_stale_api: str,
+    ) -> None:
+        """Run start_g4_256g.sh detached and stream log chunks + NVMe shard progress every ~4s."""
+        runner_script = (
+            "#!/usr/bin/env bash\n"
+            "set -uo pipefail\n"
+            f"{clean_stale_gcs}"
+            f"{clean_stale_api}"
+            "mkdir -p /content/project-maya\n"
+            "tar -xzf /tmp/maya-g4-runtime.tar.gz -C /content/project-maya/\n"
+            "cp -f /tmp/maya-ds4.json /content/project-maya/maya-ds4.json\n"
+            "cp -f /tmp/pack-meta-256g.tar.gz /content/project-maya/pack-meta-256g.tar.gz\n"
+            "chmod +x /tmp/start_g4_256g.sh\n"
+            f"env {env_exports} bash /tmp/start_g4_256g.sh\n"
+            "rc=$?\n"
+            'echo "$rc" > /tmp/studio_boot.rc\n'
+            'exit "$rc"\n'
+        )
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".sh", delete=False) as tf:
+            tf.write(runner_script)
+            tmp_runner = Path(tf.name)
+        try:
+            self._upload_file(session, tmp_runner, "/tmp/studio_boot_runner.sh")
+        finally:
+            try:
+                tmp_runner.unlink()
+            except OSError:
+                pass
+
+        launch_py = (
+            "import subprocess\n"
+            "cmd = \"rm -f /tmp/studio_boot.log /tmp/studio_boot.rc /tmp/studio_boot.pid "
+            "&& chmod +x /tmp/studio_boot_runner.sh "
+            "&& (if command -v stdbuf >/dev/null 2>&1; then "
+            "nohup stdbuf -oL -eL bash /tmp/studio_boot_runner.sh > /tmp/studio_boot.log 2>&1 < /dev/null & "
+            "else nohup bash /tmp/studio_boot_runner.sh > /tmp/studio_boot.log 2>&1 < /dev/null & fi; "
+            "echo $! > /tmp/studio_boot.pid)\"\n"
+            "subprocess.run(['bash', '-lc', cmd], check=True)\n"
+        )
+        rc, out, err = self._run_bounded(
+            [self.colab_bin, "exec", "-s", session, "--timeout", "30"],
+            stdin_data=launch_py,
+            timeout=40.0,
+        )
+        if rc != 0:
+            raise RuntimeError((err or out).strip()[-300:] or "启动远端引导脚本失败")
+
+        if mode_id == "a_dual_disk":
+            target_bytes = 346_378_296_480
+        elif mode_id in ("b1_gcs", "b2_shm"):
+            target_bytes = 110_595_290_592
+        else:
+            target_bytes = 205_809_923_712
+
+        offset = 0
+        prev_bytes = 0
+        prev_t = time.monotonic()
+        ema_bps = 0.0
+        last_dl_log_t = 0.0
+        in_download_stage = False
+        in_compile_stage = False
+        deadline = time.monotonic() + 1800.0
+        poll_fail_streak = 0
+
+        while time.monotonic() < deadline:
+            poll_py = (
+                "import json, os\n"
+                f"offset = {offset}\n"
+                "chunk = ''\n"
+                "new_off = offset\n"
+                "if os.path.isfile('/tmp/studio_boot.log'):\n"
+                "    try:\n"
+                "        with open('/tmp/studio_boot.log', 'rb') as f:\n"
+                "            f.seek(offset)\n"
+                "            data = f.read(65536)\n"
+                "            new_off = offset + len(data)\n"
+                "            chunk = data.decode('utf-8', 'replace')\n"
+                "    except Exception:\n"
+                "        pass\n"
+                "rc = None\n"
+                "if os.path.isfile('/tmp/studio_boot.rc'):\n"
+                "    try:\n"
+                "        rc = int(open('/tmp/studio_boot.rc').read().strip())\n"
+                "    except Exception:\n"
+                "        pass\n"
+                "alive = False\n"
+                "if os.path.isfile('/tmp/studio_boot.pid'):\n"
+                "    try:\n"
+                "        pid = int(open('/tmp/studio_boot.pid').read().strip())\n"
+                "        os.kill(pid, 0)\n"
+                "        alive = True\n"
+                "    except Exception:\n"
+                "        pass\n"
+                "sb = 0\n"
+                "for d in ('/content/maya-models', '/mnt/local-scratch/maya-shards', '/dev/shm/maya-s2'):\n"
+                "    if os.path.isdir(d):\n"
+                "        for dp, _, fns in os.walk(d):\n"
+                "            for fn in fns:\n"
+                "                if fn.endswith('.gguf') or fn.endswith('.incomplete'):\n"
+                "                    fp = os.path.join(dp, fn)\n"
+                "                    if not os.path.islink(fp):\n"
+                "                        try:\n"
+                "                            sb += os.path.getsize(fp)\n"
+                "                        except OSError:\n"
+                "                            pass\n"
+                "print('STUDIO_BOOT_POLL:' + json.dumps({'offset': new_off, 'chunk': chunk, 'rc': rc, 'alive': alive, 'shard_bytes': sb}, ensure_ascii=False))\n"
+            )
+            p_rc, p_out, _ = self._run_bounded(
+                [self.colab_bin, "exec", "-s", session, "--timeout", "20"],
+                stdin_data=poll_py,
+                timeout=25.0,
+            )
+            parsed = _extract_marked_json(p_out, "STUDIO_BOOT_POLL:")
+            if parsed is None:
+                poll_fail_streak += 1
+                if poll_fail_streak >= 10:
+                    raise RuntimeError("连续多次无法轮询远端部署状态，请检查 Colab 会话连接")
+                time.sleep(4.0)
+                continue
+            poll_fail_streak = 0
+
+            offset = int(parsed.get("offset") or offset)
+            chunk = str(parsed.get("chunk") or "")
+            boot_rc = parsed.get("rc")
+            alive = bool(parsed.get("alive"))
+            shard_bytes = int(parsed.get("shard_bytes") or 0)
+
+            for raw_ln in chunk.splitlines():
+                ln = raw_ln.replace("\r", "").strip()
+                if not ln:
+                    continue
+                self.logs.emit("deploy", "info", ln)
+                if "[4/6]" in ln:
+                    in_download_stage = True
+                if "[5/6]" in ln or "[6/6]" in ln or "gcs_tls_pread" in ln:
+                    in_compile_stage = True
+                    in_download_stage = False
+
+            now = time.monotonic()
+            dt = max(0.1, now - prev_t)
+            if shard_bytes > prev_bytes and dt > 0.5:
+                inst_bps = (shard_bytes - prev_bytes) / dt
+                ema_bps = inst_bps if ema_bps <= 0.0 else (0.35 * inst_bps + 0.65 * ema_bps)
+            prev_bytes = max(prev_bytes, shard_bytes)
+            prev_t = now
+
+            if in_compile_stage:
+                self._set_deployment(
+                    phase="starting",
+                    step_index=4,
+                    step_label="编译 gcs_tls_pread.so 加速库并拉起引擎",
+                    percent=51.0,
+                    sub_percent=None,
+                    detail="gcc -O2 编译双模态预读库并后台启动 maya.py",
+                    eta_text="本步预计 ~15–30 秒",
+                )
+            elif in_download_stage or shard_bytes > 50_000_000:
+                frac = min(1.0, shard_bytes / max(1, target_bytes))
+                pct = round(18.0 + 30.0 * frac, 1)
+                sub_pct = round(100.0 * frac, 1)
+                cur_gib = shard_bytes / (1024 ** 3)
+                tot_gib = target_bytes / (1024 ** 3)
+                speed_str = f" · {ema_bps / 1048576:.0f} MiB/s" if ema_bps > 1_048_576 else ""
+                if ema_bps > 5_000_000 and shard_bytes < target_bytes:
+                    dl_rem = max(0.0, (target_bytes - shard_bytes) / ema_bps)
+                    eta = f"分片剩余 ~{_fmt_duration(dl_rem)} · 预计总剩余 ~{_fmt_duration(dl_rem + 920.0)}"
+                elif frac >= 0.99:
+                    eta = "分片已就绪，即将编译加速库 (~15s)"
+                else:
+                    eta = "分片拉取预计 ~8–11 分钟 · 随后装入显存 ~15 分钟"
+                self._set_deployment(
+                    phase="mounting",
+                    step_index=3,
+                    step_label=f"高速拉取 NVMe 模型分片 ({sub_pct:.1f}%)",
+                    percent=pct,
+                    sub_percent=sub_pct,
+                    detail=f"已拉取 {cur_gib:.1f} / {tot_gib:.1f} GiB{speed_str}",
+                    eta_text=eta,
+                )
+                if now - last_dl_log_t >= 16.0:
+                    last_dl_log_t = now
+                    self.logs.emit(
+                        "deploy",
+                        "info",
+                        f"[3/6] NVMe 分片进度: {sub_pct:.1f}% ({cur_gib:.1f} / {tot_gib:.1f} GiB{speed_str})",
+                    )
+
+            if boot_rc is not None:
+                if int(boot_rc) != 0:
+                    raise RuntimeError(f"远端启动脚本失败 (exit={boot_rc})，请查看右侧部署日志")
+                return
+            if not alive and offset > 0 and p_rc == 0:
+                # Re-check rc briefly before exiting
+                if boot_rc is None:
+                    raise RuntimeError("远端部署进程意外退出，未写入退出码，请检查右侧日志")
+
+            time.sleep(4.0)
+
+        raise RuntimeError("远端启动脚本执行超时 (30m)")
 
     def _wait_for_engine_ready(self, *, session: str, tunnel_url: str, engine_kind: str) -> None:
         """Wait until the remote engine finishes loading experts into VRAM/RAM and serves :8000."""
@@ -1321,6 +1743,7 @@ class ColabManager:
         deadline = time.monotonic() + 2400.0
         last_log_check = 0.0
         last_label = ""
+        ram_track: dict[str, float] = {}
         log_probe_py = (
             "from pathlib import Path\n"
             "p = Path('/content/project-maya/maya-ds4.log')\n"
@@ -1334,35 +1757,44 @@ class ColabManager:
                 return
 
             now = time.monotonic()
-            if engine_kind == "maya" and self.colab_bin and (now - last_log_check >= 20.0):
+            if engine_kind == "maya" and self.colab_bin and (now - last_log_check >= 8.0):
                 last_log_check = now
                 rc, out, _ = self._run_bounded(
                     [self.colab_bin, "exec", "-s", session, "--timeout", "15"],
                     stdin_data=log_probe_py,
                     timeout=20.0,
                 )
-                label = ""
+                parsed = None
                 if rc == 0 and out:
-                    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
-                    for ln in reversed(lines):
-                        m_ram = re.search(r"ds4:\s*copying experts\s*(\d+)\s*/\s*(\d+)\s*\(([^)]+)\)", ln)
-                        if m_ram:
-                            label = f"正在装入 RAM 专家权重: {m_ram.group(1)}/{m_ram.group(2)} ({m_ram.group(3)})"
-                            break
-                        m_vram = re.search(r"ds4:\s*experts\s*(\d+)\s*/\s*(\d+)\s*\(([^)]+)\)", ln)
-                        if m_vram:
-                            label = f"正在装入 VRAM 专家权重: {m_vram.group(1)}/{m_vram.group(2)} ({m_vram.group(3)})"
-                            break
-                        m_start = re.search(r"\[maya\]\s*still starting\s*\((\d+)\s*s\)", ln)
-                        if m_start:
-                            label = f"引擎正在加载权重与初始化 ({m_start.group(1)}s)..."
-                            break
-                if not label and tel.get("online"):
-                    label = "引擎端口 :8000 已监听，正在完成最终权重初始化..."
-                if label and label != last_label:
-                    last_label = label
-                    self._set_deployment(phase="warming", step_index=6, step_label=label)
-                    self.logs.emit("deploy", "info", f"[6/6] {label}")
+                    parsed = _parse_maya_warmup_lines(out.splitlines(), ram_track)
+                if parsed:
+                    self._set_deployment(
+                        phase="warming",
+                        step_index=6,
+                        step_label=parsed["label"],
+                        percent=parsed["percent"],
+                        sub_percent=parsed["sub_percent"],
+                        detail=parsed["detail"],
+                        eta_text=parsed["eta_text"],
+                    )
+                    log_line = f"[6/6] {parsed['label']} · {parsed['detail']} · {parsed['eta_text']}"
+                    if log_line != last_label:
+                        last_label = log_line
+                        self.logs.emit("deploy", "info", log_line)
+                elif tel.get("online"):
+                    fallback_lbl = "引擎端口 :8000 已监听，正在完成最终权重初始化..."
+                    self._set_deployment(
+                        phase="warming",
+                        step_index=6,
+                        step_label=fallback_lbl,
+                        percent=99.0,
+                        sub_percent=99.0,
+                        detail="CUDA 图与预热即将完成",
+                        eta_text="预计剩余 < 15s",
+                    )
+                    if fallback_lbl != last_label:
+                        last_label = fallback_lbl
+                        self.logs.emit("deploy", "info", f"[6/6] {fallback_lbl}")
 
             time.sleep(5.0)
 
