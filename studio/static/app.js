@@ -599,8 +599,29 @@
         <span class="mode-card-desc">${escapeHtml(desc)}</span>
       `;
       btn.addEventListener("click", () => {
+        const changed = ui.selectedMode !== mode.id;
         ui.selectedMode = mode.id;
         renderMayaModes();
+        if (changed) {
+          // 切换 Maya 加速模式卡片后自动持久化保存，避免用户误以为点选即生效却忘记点底部保存按钮
+          const settings = collectSettingsPayload();
+          apiRequest("/api/studio/engine/configure", {
+            method: "POST",
+            body: {
+              kind: "maya",
+              mode: mode.id,
+              upstream_url: ui.lastState?.engine?.upstream_url || "",
+              settings,
+            },
+          })
+            .then(() => refreshStateNow())
+            .then(() => {
+              showToast(
+                ui.lang === "zh" ? `已切换并保存：${mode.title_zh}` : `Saved mode: ${mode.title_en}`
+              );
+            })
+            .catch(() => {});
+        }
       });
       container.appendChild(btn);
     });
@@ -662,11 +683,20 @@
   function renderDeploySteps(deployment, engineOnline) {
     const grid = $("deployStepsGrid");
     if (!grid) return;
-    const rawIndex = Number(deployment?.step_index || 0);
-    const stepIndex = engineOnline ? 6 : Math.max(0, Math.min(6, rawIndex));
     const phase = String(deployment?.phase || "idle").toLowerCase();
-    const isDeploying = !engineOnline && phase !== "idle" && phase !== "ready" && phase !== "error" && stepIndex > 0 && !deployment?.error;
-    const pct = resolveDeployPercent(deployment, engineOnline, stepIndex);
+    const hasUpstream = Boolean(ui.lastState?.engine?.upstream_url);
+    const staleIdleOrReady = !engineOnline && (phase === "idle" || (phase === "ready" && !hasUpstream));
+    const rawIndex = staleIdleOrReady ? 0 : Number(deployment?.step_index || 0);
+    const stepIndex = engineOnline ? 6 : Math.max(0, Math.min(6, rawIndex));
+    const isDeploying =
+      !engineOnline &&
+      phase !== "idle" &&
+      phase !== "ready" &&
+      phase !== "error" &&
+      stepIndex > 0 &&
+      !deployment?.error;
+    const isWarmingWithUpstream = !engineOnline && hasUpstream && !deployment?.error;
+    const pct = staleIdleOrReady ? 0 : resolveDeployPercent(deployment, engineOnline, stepIndex);
     const pctStr = `${pct.toFixed(pct > 0 && pct < 100 ? 1 : 0)}%`;
 
     const counter = $("deployStepCounter");
@@ -678,14 +708,14 @@
     const bar = $("deployProgressBar");
     if (bar) {
       bar.style.width = `${pct}%`;
-      bar.classList.toggle("is-active", !engineOnline && pct > 0 && !deployment?.error);
+      bar.classList.toggle("is-active", isDeploying || isWarmingWithUpstream);
     }
 
     const detailEl = $("deployDetailText");
     if (detailEl) {
       if (deployment?.error) {
         detailEl.textContent = deployment.error;
-      } else if (deployment?.detail) {
+      } else if (!staleIdleOrReady && deployment?.detail) {
         detailEl.textContent = deployment.detail;
       } else {
         detailEl.textContent =
@@ -697,16 +727,18 @@
 
     const etaEl = $("deployEtaText");
     if (etaEl) {
-      etaEl.textContent = buildEtaSummary(deployment, engineOnline);
+      etaEl.textContent = staleIdleOrReady ? "--" : buildEtaSummary(deployment, engineOnline);
     }
 
     const summary = $("deployStatusSummary");
     if (summary) {
       if (engineOnline) {
         summary.textContent = deployment?.step_label || t("status.online");
+      } else if (staleIdleOrReady) {
+        summary.textContent = t("deploy.idleSummary");
       } else if (deployment?.step_label && deployment.step_label !== "部署完成，引擎在线") {
         summary.textContent = deployment.step_label;
-      } else if (isDeploying) {
+      } else if (isDeploying || isWarmingWithUpstream) {
         summary.textContent =
           ui.lang === "zh" ? "隧道已连通 · 正在等待远端引擎完成权重装入..." : "Tunnel connected · Loading weights into VRAM/RAM...";
       } else {
@@ -726,8 +758,8 @@
 
     grid.innerHTML = "";
     DEPLOY_STEPS.forEach((item) => {
-      const done = engineOnline || (stepIndex > item.step) || (item.step < 6 && stepIndex === 6 && !deployment?.error);
-      const active = !done && !deployment?.error && (stepIndex === item.step);
+      const done = !staleIdleOrReady && (engineOnline || (stepIndex > item.step) || (item.step < 6 && stepIndex === 6 && !deployment?.error));
+      const active = !staleIdleOrReady && !done && !deployment?.error && (stepIndex === item.step);
       const subPct = active && typeof deployment?.sub_percent === "number" ? Math.max(0, Math.min(100, deployment.sub_percent)) : null;
       const el = document.createElement("div");
       el.className = `step-item${done ? " is-done" : ""}${active ? " is-active" : ""}`;
@@ -751,7 +783,10 @@
     const engineOnline = Boolean(engine.online) && engine.loaded !== false;
     const stepIndex = Number(deploy.step_index || 0);
     const phase = String(deploy.phase || "idle").toLowerCase();
-    const isActive = !engineOnline && (phase !== "idle" && phase !== "ready" && phase !== "error" ? true : Boolean(engine.upstream_url));
+    const isActive =
+      !engineOnline &&
+      !deploy.error &&
+      ((phase !== "idle" && phase !== "ready" && phase !== "error" && stepIndex > 0) || Boolean(engine.upstream_url));
     const isError = !engineOnline && Boolean(deploy.error);
 
     if (!engineOnline && !isActive && !isError) {
@@ -1023,7 +1058,14 @@
     // Topbar status pill
     const pill = $("topStatusPill");
     const pillText = $("topStatusText");
-    const isDeploying = !engine.online && Number(deploy.step_index || 0) > 0 && !deploy.error;
+    const deployPhase = String(deploy.phase || "idle").toLowerCase();
+    const isDeploying =
+      !engine.online &&
+      deployPhase !== "idle" &&
+      deployPhase !== "ready" &&
+      deployPhase !== "error" &&
+      Number(deploy.step_index || 0) > 0 &&
+      !deploy.error;
     const hasUpstream = Boolean(engine.upstream_url);
     if (pill && pillText) {
       pill.classList.remove("status-pill--online", "status-pill--loading", "status-pill--offline");

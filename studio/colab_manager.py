@@ -903,25 +903,31 @@ class ColabManager:
         with self._lock:
             prev = self._deployment
             now = time.time()
-            if reset_timer:
-                started_at: float | None = now
-                elapsed_sec = 0
-                prev_pct = 0.0
-            else:
-                started_at = prev.get("started_at")
-                if started_at is None and phase not in ("idle",):
-                    started_at = now
-                elapsed_sec = int(max(0.0, now - float(started_at))) if started_at is not None else int(prev.get("elapsed_sec") or 0)
-                prev_pct = float(prev.get("percent") or 0.0)
-
             if phase == "idle":
+                # 回到待机态时清零计时与进度，避免旧部署进度或计时残留到下一轮展示
+                started_at = None
+                elapsed_sec = 0
                 next_pct = 0.0
-            elif percent is None:
-                next_pct = prev_pct
-            elif phase == "error":
-                next_pct = round(float(percent), 1)
+                next_sub_pct = None
             else:
-                next_pct = max(prev_pct, min(100.0, round(float(percent), 1)))
+                if reset_timer:
+                    started_at: float | None = now
+                    elapsed_sec = 0
+                    prev_pct = 0.0
+                else:
+                    started_at = prev.get("started_at")
+                    if started_at is None:
+                        started_at = now
+                    elapsed_sec = int(max(0.0, now - float(started_at))) if started_at is not None else int(prev.get("elapsed_sec") or 0)
+                    prev_pct = float(prev.get("percent") or 0.0)
+
+                if percent is None:
+                    next_pct = prev_pct
+                elif phase == "error":
+                    next_pct = round(float(percent), 1)
+                else:
+                    next_pct = max(prev_pct, min(100.0, round(float(percent), 1)))
+                next_sub_pct = None if sub_percent is None else max(0.0, min(100.0, round(float(sub_percent), 1)))
 
             self._deployment = {
                 "phase": phase,
@@ -929,7 +935,7 @@ class ColabManager:
                 "step_total": 6,
                 "step_label": step_label,
                 "percent": next_pct,
-                "sub_percent": None if sub_percent is None else max(0.0, min(100.0, round(float(sub_percent), 1))),
+                "sub_percent": next_sub_pct,
                 "detail": prev.get("detail", "") if detail is None else detail,
                 "eta_text": prev.get("eta_text", "") if eta_text is None else eta_text,
                 "started_at": started_at,
@@ -954,6 +960,7 @@ class ColabManager:
                 "error": "未检测到 colab CLI 或 colab_cli 运行环境",
             }
 
+        clear_maya_upstream = False
         with self._lock:
             for k in ("logged_in", "email", "paid_balance", "burn_rate_hourly", "active_assignments", "sessions"):
                 if k in data:
@@ -968,6 +975,33 @@ class ColabManager:
                         if acc in ("G4", "A100", "H100", "L4", "T4"):
                             self._colab_state["selected_gpu"] = acc
                             break
+
+            # 会话自然到期或被外部回收后（active_assignments == 0），在非部署期自动清理残留 GPU/挂载与 Maya 状态
+            if bool(data.get("ok")) and bool(data.get("logged_in")) and int(data.get("active_assignments") or 0) == 0:
+                deploy_busy = self._deploy_thread is not None and self._deploy_thread.is_alive()
+                if not deploy_busy:
+                    self._colab_state["gpu_name"] = ""
+                    self._colab_state["mounts"] = {}
+                    if self.config.engine_kind == "maya":
+                        if str(self._deployment.get("phase") or "") in ("ready", "warming"):
+                            self._set_deployment(
+                                phase="idle",
+                                step_index=0,
+                                step_label="",
+                                percent=0.0,
+                                sub_percent=None,
+                                detail="",
+                                eta_text="",
+                                error="",
+                            )
+                        if self.config.upstream_url:
+                            clear_maya_upstream = True
+
+        if clear_maya_upstream:
+            self.config.set_selection(upstream_url="")
+            self.proxy.set_upstream("", engine_kind="maya", api_key="")
+            if self.on_telemetry_refresh is not None:
+                self.on_telemetry_refresh()
 
         if log_event:
             if data.get("logged_in"):
@@ -1067,6 +1101,8 @@ class ColabManager:
                     "burn_rate_hourly": None,
                     "active_assignments": 0,
                     "sessions": [],
+                    "gpu_name": "",
+                    "mounts": {},
                 }
             )
         self.logs.emit("colab", "info", "已退出当前 Google Colab OAuth 会话")
@@ -1863,9 +1899,22 @@ class ColabManager:
             return {"ok": False, "error": "未找到 colab CLI 或 colab_cli"}
 
         if res.get("ok"):
+            with self._lock:
+                self._colab_state["gpu_name"] = ""
+                self._colab_state["mounts"] = {}
+            self._set_deployment(
+                phase="idle",
+                step_index=0,
+                step_label="",
+                percent=0.0,
+                sub_percent=None,
+                detail="",
+                eta_text="",
+                error="",
+            )
             if self.config.engine_kind == "maya":
                 self.config.set_selection(upstream_url="")
-                self.proxy.set_upstream("", engine_kind="maya")
+                self.proxy.set_upstream("", engine_kind="maya", api_key="")
                 if self.on_telemetry_refresh is not None:
                     self.on_telemetry_refresh()
             self.refresh_auth_status(log_event=False)
