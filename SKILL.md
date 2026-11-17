@@ -47,21 +47,24 @@ Store your own credentials outside this repository (or use the `.gitignore`-excl
 ```bash
 mkdir -p ~/.config/maya-gcs
 chmod 700 ~/.config/maya-gcs
-cp path/to/your-service-account.json ~/.config/maya-gcs/gcs-key.json
-echo "your-gcs-bucket-name" > ~/.config/maya-gcs/bucket
+# Default recommended (Mode B1-Pure, MAYA_S2_GCS_DISABLE=1): only hf-token is required ($0 GCS)
 echo "hf_your_huggingface_token" > ~/.config/maya-gcs/hf-token
+
+# Optional (only when enabling Mode B1 single-region GCS burst; avoid `us` Multi-Region to prevent egress charges)
+cp path/to/your-service-account.json ~/.config/maya-gcs/gcs-key.json
+echo "your-single-region-gcs-bucket" > ~/.config/maya-gcs/bucket
 chmod 600 ~/.config/maya-gcs/*
 ```
 
-If GCS credentials are omitted on G4 while `hf-token` is provided, [start_g4_256g.sh](./scripts/start_g4_256g.sh) still runs full-RAM Mode B1 via `/mnt/hf` (`hf_ro_fuse` + `MAYA_S2_GCS_DISABLE=1`); only when neither `hf-token` nor GCS credentials are present does it fall back to Mode B2 (G4 `/dev/shm`).
+By default, [deploy_from_mac.sh](./scripts/deploy_from_mac.sh) and Studio run **Mode B1-Pure (`MAYA_S2_GCS_DISABLE=1`)** via `/mnt/hf` (`hf_ro_fuse` + local NVMe) using `hf-token` alone (zero GCS dependency or egress). To opt into dual-regime GCS burst in CLI mode, pass `MAYA_S2_GCS_DISABLE=0 bash scripts/deploy_from_mac.sh easycolab`; only when neither `hf-token` nor GCS credentials are present does [start_g4_256g.sh](./scripts/start_g4_256g.sh) fall back to Mode B2 (G4 `/dev/shm`).
 
 ---
 
 ### What [deploy_from_mac.sh](./scripts/deploy_from_mac.sh) and [start_g4_256g.sh](./scripts/start_g4_256g.sh) Do:
-1. **Enables GPU Persistence & Uploads Prebuilt Runtime (`~3s`)**: Enables `nvidia-smi -pm 1` (`600.00 W` TDP preserved on G4) and pushes `maya-g4-runtime.tar.gz`, `maya-a100-sm80-build.tar.gz` (when present), `maya-ds4.json`, `pack-meta-256g.tar.gz`, `start_g4_256g.sh`, `src/hf_ro_fuse.c`, `src/gcs_tls_pread.c`, and GCS/HF credentials to `/tmp` on the Colab VM.
-2. **Adaptive Dual-Disk / HF-FUSE+GCS / RAMDisk Storage Split (`Zero-Boot-GCS` default)**:
+1. **Enables GPU Persistence & Uploads Prebuilt Runtime (`~3s`)**: Enables `nvidia-smi -pm 1` (`600.00 W` TDP preserved on G4) and pushes `maya-g4-runtime.tar.gz`, `maya-a100-sm80-build.tar.gz` (when present), `maya-ds4.json`, `pack-meta-256g.tar.gz`, `start_g4_256g.sh`, `src/hf_ro_fuse.c`, `src/gcs_tls_pread.c`, and HF credentials (plus GCS credentials only when `MAYA_S2_GCS_DISABLE=0` / Mode B1) to `/tmp` on the Colab VM.
+2. **Adaptive Dual-Disk / HF-FUSE+Pure / Optional GCS Burst / RAMDisk Layout (`Mode B1-Pure` default)**:
    - **Mode A (A100 Dual-Disk, `/mnt/local-scratch` ≥ 200G)**: Sets `HF_HOME=/mnt/local-scratch/hf-cache`, symlinks `Shards 00001..00003` (`~183 GiB`) into `/mnt/local-scratch/maya-shards`, downloads `Shards 00004..00007` + `dspark` + `vision` to `/content/maya-models/`, keeping system RAM free (`DS4_RAM_MARGIN_GB=6.0`, `DS4_ENGRAM_CACHE_MB=4096`, `DS4_LENT_RAM_GB=4.5`, `--prefill-chunk 16384`).
-   - **Mode B1 (G4 Zero-Boot-GCS Full-RAM + HTTP/2 Dual-Regime Acceleration — Default when `HF_TOKEN` is set)**:
+   - **Mode B1-Pure (Default Recommended when `HF_TOKEN` is set, `MAYA_S2_GCS_DISABLE=1`) & Optional Mode B1 (Same Single-Region GCS Burst)**:
      - Compiles `src/hf_ro_fuse.c` (`fuse3` + `libcurl`) and mounts `/mnt/hf` read-only backed by Hugging Face's presigned GCP CDN URLs (`us.gcp.cdn.hf.co`, `$0.00/GB`, refreshed every `1200s` into `/dev/shm/.maya_hf_urls` by `maya_url_token_refresher.sh`), pulls `Shards 00001..00004`, `dspark/`, and `vision/` onto local NVMe SSD via Hugging Face Xet (`HF_XET_HIGH_PERFORMANCE=1`, `~305 MiB/s`, `$0.00/GB`), and symlinks **only `Shards 00005, 00006, 00007`** (`~131 GiB`) from `/mnt/hf/Mix-256G/` (`0.00 GB` GCS boot egress!). Set `MAYA_SHARDS57_SOURCE=gcs` + `MAYA_PREFER_GCS_DOWNLOAD=1` only if you want legacy `/mnt/gcs` `gcsfuse` cold boot. **`Shard 00002` must never live on FUSE** (see §3.6).
      - Compiles **`gcs_tls_pread.so`** (`-lcurl -ldl -lpthread`) with two complementary bypasses:
        1. **FUSE `> 256 KB` Direct HTTPS HTTP/2 `Range` Bypass (`fuse_direct_pread64`)** + `2 MB` per-thread TLS metadata windows: intercepts `/mnt/hf/` (direct `us.gcp.cdn.hf.co`, `$0/GB`) and `/mnt/gcs/` directly in C, eliminating FUSE kernel read amplification while keeping `hf_ro_fuse` `mmap()` page faults bit-exact (`100%` VRAM + RAM residency, `disk_gb=0.0`).
@@ -218,7 +221,7 @@ Beyond headless CLI scripts, the repository ships **Maya · Strata Studio** (`st
 - **Top Control Bar**: Connection status pill, engine & GPU badges, `示例接入指南`, external browser launcher, `中 / EN` toggle, and **Screen-Recording Privacy Mask (`录屏隐私打码`)**. In `MayaStudio.app` (`?shell=macos`), `78px` left padding clears the native macOS traffic-light buttons.
 - **Left Panel (`Colab 算力实例 & 额度` + `推理引擎与加速模式`)**:
   - Google OAuth PKCE login/refresh, GPU selector (`G4` never sends `--high-mem`; only `A100` uses `--high-mem`), session input, `⚡ 唤醒实例并部署`, `🔗 无损纳管已运行会话`, CU balance / hourly burn rate, `12m 保活` switch, and confirmation-guarded stop.
-  - Segmented engine switcher: **Project Maya (`ds4`)** with 5 selectable mode cards (`Mode B1`, `Mode B1-Pure`, `Mode A`, `Mode B1-GCS`, `Mode B2` + collapsible `HF Repo` / `MAYA_S2_GCS_THRESH` / `MAYA_S2_LOCAL_MAX` / context / `--vision` options) vs. **Strata Engine (`strata`)**, plus the `~/.config/maya-gcs/` credentials status bar.
+  - Segmented engine switcher: **Project Maya (`ds4`)** with 5 selectable mode cards (`Mode B1-Pure` default recommended, `Mode B1` optional single-region GCS burst, `Mode A`, `Mode B1-GCS`, `Mode B2` + collapsible `HF Repo` / `MAYA_S2_GCS_THRESH` / `MAYA_S2_LOCAL_MAX` / context / `--vision` options) vs. **Strata Engine (`strata`)**, plus the `~/.config/maya-gcs/` credentials status bar.
 - **Center Stage**:
   - `🖥️ 原生 WebUI 控制台`: Same-origin `<iframe>` pointing to `http://127.0.0.1:18766/` (proxied Maya `:8000` or Strata Dashboard with `X-Frame-Options` / `frame-ancestors` stripped and upstream `Host`/`Origin` rewritten for `_own_page()` compatibility), or a 6-step deployment pipeline + one-click `easycolab` attach card when offline.
   - `📊 实时遥测与对话探针`: Live `Prefill tok/s`, `Decode tok/s`, `VRAM 命中率`, `总请求数`, `活跃队列`, recent requests table, and `/v1/chat/completions` probe.

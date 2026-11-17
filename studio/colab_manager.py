@@ -1374,7 +1374,7 @@ class ColabManager:
         gpu: str = "G4",
         session: str = "easycolab",
         engine_kind: str = "maya",
-        mode: str = "b1_hf_fuse",
+        mode: str = "b1_pure_hf",
         settings: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Start asynchronous 6-stage Colab provisioning & Maya/Strata deployment."""
@@ -1384,7 +1384,7 @@ class ColabManager:
 
         sess = (session or "easycolab").strip()
         kind = engine_kind if engine_kind in ("maya", "strata") else "maya"
-        mode_id = mode if mode in MODES_BY_ID else "b1_hf_fuse"
+        mode_id = mode if mode in MODES_BY_ID else "b1_pure_hf"
 
         with self._lock:
             if self._deploy_thread is not None and self._deploy_thread.is_alive():

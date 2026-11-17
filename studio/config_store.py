@@ -63,39 +63,39 @@ DEFAULT_HF_REPO = "orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF"
 
 MODES_CATALOG: list[dict[str, Any]] = [
     {
-        "id": "b1_hf_fuse",
-        "name": "Mode B1 · 零冷启 GCS 流量",
-        "name_en": "Mode B1 · Zero-Boot-GCS (HF FUSE3 + HTTP/2)",
+        "id": "b1_pure_hf",
+        "name": "Mode B1-Pure · 纯 HF 零云存储",
+        "name_en": "Mode B1-Pure · Pure Hugging Face (Zero GCS)",
         "badge": "推荐",
         "recommended": True,
-        "short_desc": "Shards 1–4 走 HF Xet (~305 MiB/s, $0)，Shards 5–7 挂载 /mnt/hf FUSE3 + HTTP/2，可选 GCS 双模突发加速。",
+        "short_desc": "MAYA_S2_GCS_DISABLE=1，仅需 HF Token + /mnt/hf FUSE3 + HTTP/2，零云存储月租与零 GCS 跨区流量费。",
         "env": {
             "MAYA_SHARDS57_SOURCE": "hf_fuse",
             "MAYA_PREFER_GCS_DOWNLOAD": "0",
-            "MAYA_S2_GCS_DISABLE": "0",
+            "MAYA_S2_GCS_DISABLE": "1",
         },
         "script_env": {
             "MAYA_SHARDS57_SOURCE": "hf",
             "MAYA_PREFER_GCS_DOWNLOAD": "0",
-            "MAYA_S2_GCS_DISABLE": "0",
+            "MAYA_S2_GCS_DISABLE": "1",
         },
     },
     {
-        "id": "b1_pure_hf",
-        "name": "Mode B1-Pure · 纯 HF 零云存储",
-        "name_en": "Mode B1-Pure · Pure Hugging Face (No GCS)",
-        "badge": "零 GCS",
+        "id": "b1_hf_fuse",
+        "name": "Mode B1 · 同区 GCS 突发加速 (可选)",
+        "name_en": "Mode B1 · Same-Region GCS Burst (Optional)",
+        "badge": "可选 GCS",
         "recommended": False,
-        "short_desc": "MAYA_S2_GCS_DISABLE=1，仅使用 HF Token + /mnt/hf FUSE3，完全不依赖或消耗 GCS 流量。",
+        "short_desc": "Shards 1–4 走 HF Xet，Shards 5–7 走 /mnt/hf；仅在配置与 Colab 同单区域 GCS 桶时启用 >160 突发加速（勿用多区域桶）。",
         "env": {
             "MAYA_SHARDS57_SOURCE": "hf_fuse",
             "MAYA_PREFER_GCS_DOWNLOAD": "0",
-            "MAYA_S2_GCS_DISABLE": "1",
+            "MAYA_S2_GCS_DISABLE": "0",
         },
         "script_env": {
             "MAYA_SHARDS57_SOURCE": "hf",
             "MAYA_PREFER_GCS_DOWNLOAD": "0",
-            "MAYA_S2_GCS_DISABLE": "1",
+            "MAYA_S2_GCS_DISABLE": "0",
         },
     },
     {
@@ -167,7 +167,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 
 def resolve_mode_env(mode_id: str, settings: dict[str, Any] | None = None, *, for_script: bool = False) -> dict[str, str]:
     """Return environment variable mapping for one of the 5 Maya deployment modes."""
-    entry = MODES_BY_ID.get(mode_id) or MODES_BY_ID["b1_hf_fuse"]
+    entry = MODES_BY_ID.get(mode_id) or MODES_BY_ID["b1_pure_hf"]
     key = "script_env" if for_script else "env"
     env = dict(entry[key])
     cfg = settings or {}
@@ -337,7 +337,7 @@ class ConfigStore:
         self.selected_gpu: str = "G4"
         self.selected_session: str = "easycolab"
         self.engine_kind: str = "maya"
-        self.maya_mode: str = "b1_hf_fuse"
+        self.maya_mode: str = "b1_pure_hf"
         self.upstream_url: str = ""
         self.settings: dict[str, Any] = dict(DEFAULT_SETTINGS)
         self._load_state()

@@ -729,7 +729,7 @@ class StudioServer:
                             gpu=str(body.get("gpu") or "G4"),
                             session=str(body.get("session") or "easycolab"),
                             engine_kind=str(body.get("engine_kind") or "maya"),
-                            mode=str(body.get("mode") or "b1_hf_fuse"),
+                            mode=str(body.get("mode") or rt.config.maya_mode or "b1_pure_hf"),
                             settings=body.get("settings") if isinstance(body.get("settings"), dict) else None,
                         )
                         self._send_json(200 if res.get("ok") else 400, res)

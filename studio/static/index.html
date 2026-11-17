@@ -794,7 +794,7 @@
         <div class="guide-section">
           <h4>2. G4 与加速模式说明</h4>
           <ul>
-            <li><strong>Mode B1 (默认推荐)</strong>：Shards 1–4 走 HF Xet (~305 MiB/s) 落 NVMe，Shards 5–7 通过 <code>/mnt/hf</code> FUSE3 + HTTP/2 Range 直连，零冷启 GCS 流量；<code>Shard 00002</code> 启用双模阈值 (<code>MAYA_S2_GCS_THRESH=160</code>)。</li>
+            <li><strong>Mode B1-Pure (默认推荐)</strong>：仅需 <code>HF Token</code>，Shards 1–4 走 HF Xet (~305 MiB/s) 落 NVMe，Shards 5–7 通过 <code>/mnt/hf</code> FUSE3 + HTTP/2 Range 直连，默认启用 <code>MAYA_S2_GCS_DISABLE=1</code>，零云存储月租且零跨区流量费。（若选配 <code>Mode B1</code> GCS 突发加速，请务必创建与 Colab VM 相同的单区域桶，切勿选 <code>us</code> 多区域。）</li>
             <li><strong>G4 机型防呆</strong>：Colab G4 仅支持单规格 Standard (176.9GB RAM)，创建时自动省略 <code>--high-mem</code>。</li>
             <li><strong>Strata Engine</strong>：可直连任意远端/局域网 Strata 服务（如 <code>http://192.168.x.x:18181</code> 或 <code>https://&lt;random-subdomain&gt;.trycloudflare.com</code>）。</li>
           </ul>

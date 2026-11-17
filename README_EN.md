@@ -30,11 +30,11 @@ Exposing a 96 GB cloud GPU to the internet over `https://*.trycloudflare.com` wi
 
 ## Core Features
 
-1. **Mode B1 Zero-Boot-GCS & Dual-Regime HTTP/2 Acceleration**
+1. **Mode B1-Pure Zero-GCS Default + Optional Same-Region GCS Burst Acceleration**
    - **`Shards 1–4` via Hugging Face Xet (`~305 MiB/s`, `$0`)**: Placed directly on VM local NVMe, eliminating DriveFS `D`-state hangs and boot-time GCS egress costs.
    - **`Shards 5–7` via `/mnt/hf` (`hf_ro_fuse` FUSE3 + HTTPS HTTP/2 Range)**: Reads larger than `256 KB` and `2 MB` header windows go straight to the Hugging Face CDN (`$0/GB` egress, zero local disk footprint).
-   - **`Shard 00002` `mincore()` OS Page Cache + Optional GCS Burst**: Decode calls (`tot <= 160`) stay 100% on local NVMe with zero network RTT (`~42–66 tok/s`), while massive Prefill bursts (`tot > 160`, when same-region GCS creds are supplied) split across `752` threads into `8x8` HTTP/2 `curl_multi` streams.
-   - **Five One-Click Modes**: `Mode B1` (default recommended), `Mode B1-Pure` (`MAYA_S2_GCS_DISABLE=1`, zero GCS dependency), `Mode A` (A100 dual-disk), `Mode B1-GCS` (`gcsfuse` fallback), and `Mode B2` (`110G /dev/shm` RAMDisk fallback with zero credentials).
+   - **`Shard 00002` Zero-GCS NVMe Default (`Mode B1-Pure`) + Optional Single-Region GCS Burst (`Mode B1`)**: Enables `MAYA_S2_GCS_DISABLE=1` by default so both `Shard 00002` and decode remain 100% on local NVMe with **$0 GCS storage and $0 egress**. Only when you supply a same-single-region GCS bucket (e.g., `us-central1` / `us-east4` — never `us` Multi-Region to avoid cross-region egress charges) and explicitly select `Mode B1` does `tot > 160` prefill burst across `752` threads (`8x8` HTTP/2 `curl_multi`).
+   - **Five One-Click Modes**: `Mode B1-Pure` (**default recommended**, `MAYA_S2_GCS_DISABLE=1`, zero GCS dependency), `Mode B1` (optional single-region GCS burst), `Mode A` (A100 dual-disk), `Mode B1-GCS` (`gcsfuse` fallback), and `Mode B2` (`110G /dev/shm` RAMDisk fallback with zero credentials).
 
 2. **EasyColab-Style Three-Column Workbench (Native macOS `.app` & Cross-Platform WebUI)**
    - **Top Global Bar**: Live status pill, active engine badge (`Project Maya` / `Strata Engine`), GPU chip, Quick Guide modal, external WebUI launcher, live `中 / EN` language switch, and **Screen-Recording Privacy Mask (`👁️ ON/OFF`)** that masks emails (`go***@gmail.com`), bucket identifiers, internal `gpu-*` VM IDs, and `*.trycloudflare.com` subdomains across both UI widgets and live logs. Automatically reserves `78px` left padding for macOS traffic lights when running inside `MayaStudio.app`.
@@ -134,12 +134,12 @@ Detailed troubleshooting notes covering all eight pitfalls (`DriveFS` `D`-state 
 mkdir -p ~/.config/maya-gcs
 chmod 700 ~/.config/maya-gcs
 
-# Hugging Face read token (for Mode B1 Zero-Boot-GCS / Mode A / Mode B2)
+# Hugging Face read token (sole required credential for default Mode B1-Pure Zero-GCS / Mode A / Mode B2)
 echo "hf_your_huggingface_token" > ~/.config/maya-gcs/hf-token
 
-# Optional for Mode B1 burst acceleration: same-region GCS service account & bucket
+# Optional for Mode B1 burst acceleration: single-region GCS service account & bucket matching your Colab VM region (never use `us` Multi-Region; CLI requires MAYA_S2_GCS_DISABLE=0)
 cp /path/to/your-gcs-service-account.json ~/.config/maya-gcs/gcs-key.json
-echo "your-gcs-bucket-name" > ~/.config/maya-gcs/bucket
+echo "your-single-region-gcs-bucket" > ~/.config/maya-gcs/bucket
 
 # Optional: public gateway API key to lock down your *.trycloudflare.com endpoint
 echo "sk-maya-your-strong-random-key" > ~/.config/maya-gcs/maya-api-key

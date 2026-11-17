@@ -629,13 +629,13 @@ if [ "$SCRATCH_FREE_GB" -ge 200 ]; then
   INDEX_TC=""
   CPU_PREPARE_ROWS="1"
 elif [ "$SHARDS57_SOURCE" = "hf" ] && [ -n "${HF_TOKEN:-}" ]; then
-  echo "[模式 B1: G4 零冷启 GCS 流量 (HF FUSE /mnt/hf + HTTP/2 直连加速)]"
+  echo "[模式 B1 / B1-Pure: G4 零冷启 GCS 流量 (HF FUSE /mnt/hf + HTTP/2 直连加速)]"
   echo "  -> Shards 1-4、dspark、vision 通过 Hugging Face Xet 免费高速拉取至本地 NVMe (\$0.00/GB)；"
   echo "     Shards 5-7 (~131 GiB) 挂载只读 FUSE3 /mnt/hf 并经由 HTTP/2 Range 直连旁路读取 us.gcp.cdn.hf.co (\$0.00/GB)；"
-  if [ -f /tmp/gcs-key.json ] && [ -n "$GCS_BUCKET" ]; then
-    echo "     Shard 00002 保持双模态门控 (Decode <=160 走本地 NVMe / 长文本 Prefill >160 溢流至 8×8 HTTP/2 GCS Pool)。"
+  if [ "${MAYA_S2_GCS_DISABLE:-0}" != "1" ] && [ -f /tmp/gcs-key.json ] && [ -n "$GCS_BUCKET" ]; then
+    echo "     Shard 00002 开启同区 GCS 双模态门控 (Decode <=160 走本地 NVMe / 长文本 Prefill >160 溢流至 8×8 HTTP/2 GCS Pool)。"
   else
-    echo "     未提供 GCS 凭据，Shard 00002 纯走本地 NVMe，仍实现 100% RAM/VRAM 常驻 (disk_gb=0.0)。"
+    echo "     当前运行在 Mode B1-Pure (MAYA_S2_GCS_DISABLE=1)：Shard 00002 纯走本地 NVMe，零云存储依赖，实现 100% RAM/VRAM 常驻。"
   fi
   if ! command -v fusermount3 >/dev/null 2>&1 || ! command -v gcc >/dev/null 2>&1 || ! command -v pkg-config >/dev/null 2>&1 || \
      [ ! -f /usr/include/fuse3/fuse.h ] || { [ ! -f /usr/include/x86_64-linux-gnu/curl/curl.h ] && [ ! -f /usr/include/curl/curl.h ]; }; then
@@ -681,11 +681,11 @@ elif [ "$SHARDS57_SOURCE" = "hf" ] && [ -n "${HF_TOKEN:-}" ]; then
   RESTORE_TAIL="0"
   INDEX_TC="1"
   CPU_PREPARE_ROWS="1"
-  if [ -f /tmp/gcs-key.json ] && [ -n "$GCS_BUCKET" ]; then
+  if [ "${MAYA_S2_GCS_DISABLE:-0}" != "1" ] && [ -f /tmp/gcs-key.json ] && [ -n "$GCS_BUCKET" ]; then
     ENGRAM_THREADS="768"
     S2_LOCAL_MAX="16"
     S2_GCS_THRESH="160"
-    S2_GCS_DISABLE=""
+    S2_GCS_DISABLE="${MAYA_S2_GCS_DISABLE:-0}"
   else
     ENGRAM_THREADS=""
     S2_LOCAL_MAX=""
@@ -1035,7 +1035,7 @@ if ! echo "$GPU_NAME" | grep -qi "Blackwell"; then
   rm -f "$MODEL_ROOT/Mix-256G/maya-ds4/lane-times.txt"
 fi
 
-export PREFILL_CHUNK RAM_MARGIN DISK_SKIP_W PROMPT_PICK ENGRAM_CACHE_MB LENT_RAM_GB FLOW_COPY_DMA ENGRAM_THREADS YOCO_CONE EG_RANDOM RESTORE_TAIL S2_LOCAL_MAX S2_GCS_THRESH S2_GCS_DISABLE INDEX_TC CPU_PREPARE_ROWS
+export PREFILL_CHUNK RAM_MARGIN DISK_SKIP_W PROMPT_PICK ENGRAM_CACHE_MB LENT_RAM_GB FLOW_COPY_DMA ENGRAM_THREADS YOCO_CONE EG_RANDOM RESTORE_TAIL S2_LOCAL_MAX S2_GCS_THRESH S2_GCS_DISABLE MAYA_S2_LOCAL_MAX MAYA_S2_GCS_THRESH MAYA_S2_GCS_DISABLE GCS_BUCKET INDEX_TC CPU_PREPARE_ROWS
 "$WORK_DIR/.venv/bin/python" - << 'PY'
 import json, os
 cfg_path = "/content/project-maya/maya-ds4.json"
@@ -1076,11 +1076,17 @@ opt_map = {
     "CPU_PREPARE_ROWS": "DS4_CPU_PREPARE_ROWS",
 }
 for src_k, dst_k in opt_map.items():
-    val = os.environ.get(src_k, "").strip()
+    val = (os.environ.get(src_k) or os.environ.get(dst_k) or "").strip()
     if val:
         cfg["env"][dst_k] = val
     else:
         cfg["env"].pop(dst_k, None)
+
+gcs_bucket_cfg = (os.environ.get("GCS_BUCKET") or "").strip()
+if not gcs_bucket_cfg and os.path.isfile("/tmp/gcs-bucket"):
+    gcs_bucket_cfg = open("/tmp/gcs-bucket").read().strip()
+if not (gcs_bucket_cfg and os.path.isfile("/tmp/gcs-key.json")) and "MAYA_S2_GCS_DISABLE" not in cfg["env"]:
+    cfg["env"]["MAYA_S2_GCS_DISABLE"] = "1"
 
 with open(cfg_path, "w") as f:
     json.dump(cfg, f, indent=1)

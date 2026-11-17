@@ -3,19 +3,19 @@
 
   const DEFAULT_MODES = [
     {
-      id: "b1_hf_fuse",
-      title_zh: "Mode B1 · 零冷启 GCS 流量",
-      title_en: "Mode B1 · Zero-Boot-GCS",
-      desc_zh: "HF Xet 300+ MiB/s + /mnt/hf FUSE3 + HTTP/2 双模",
-      desc_en: "HF Xet 300+ MiB/s + /mnt/hf FUSE3 + HTTP/2 Dual-Regime",
-      recommended: true,
-    },
-    {
       id: "b1_pure_hf",
       title_zh: "Mode B1-Pure · 纯 HF 零云存储",
       title_en: "Mode B1-Pure · Pure HF Zero-GCS",
-      desc_zh: "S2_GCS_DISABLE=1，完全不消耗 GCS 流量",
-      desc_en: "S2_GCS_DISABLE=1, zero GCS egress",
+      desc_zh: "MAYA_S2_GCS_DISABLE=1，仅需 HF Token，零云存储月租与零 GCS 流量费",
+      desc_en: "S2_GCS_DISABLE=1, HF Token only, zero GCS storage or egress fee",
+      recommended: true,
+    },
+    {
+      id: "b1_hf_fuse",
+      title_zh: "Mode B1 · 同区 GCS 突发加速 (可选)",
+      title_en: "Mode B1 · Optional Same-Region GCS",
+      desc_zh: "HF Xet + /mnt/hf FUSE3；仅单区域同区桶时启用 >160 GCS 突发（勿用多区域桶）",
+      desc_en: "HF Xet + /mnt/hf FUSE3; optional same single-region GCS >160 burst",
       recommended: false,
     },
     {
@@ -297,7 +297,7 @@
     activeTab: "console",
     selectedGpu: "g4",
     selectedEnginePanel: "maya",
-    selectedMode: "b1_hf_fuse",
+    selectedMode: "b1_pure_hf",
     visionOn: true,
     logCategory: "all",
     logQuery: "",

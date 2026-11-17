@@ -2,6 +2,11 @@
 set -euo pipefail
 
 SESSION="${1:-easycolab}"
+# 默认采用 Mode B1-Pure（纯 HF 零云存储，MAYA_S2_GCS_DISABLE=1）；显式传入 MAYA_S2_GCS_DISABLE=0 时才启用可选 GCS 突发加速
+MAYA_S2_GCS_DISABLE="${MAYA_S2_GCS_DISABLE:-1}"
+if [ "$MAYA_S2_GCS_DISABLE" != "0" ]; then
+  MAYA_S2_GCS_DISABLE="1"
+fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RES_DIR="$(cd "$SCRIPT_DIR/../resources" && pwd)"
 
@@ -31,17 +36,15 @@ elif [ -f "$HOME/.config/maya-gcs/gcs-key.json" ]; then
 elif [ -f "$RES_DIR/gcs-key.json" ]; then
   GCS_KEY_FILE="$RES_DIR/gcs-key.json"
 fi
+GCS_BUCKET="${MAYA_GCS_BUCKET:-$(cat "$HOME/.config/maya-gcs/bucket" "$RES_DIR/gcs-bucket" 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)}"
 
-if [ -n "$GCS_KEY_FILE" ]; then
+if [ "$MAYA_S2_GCS_DISABLE" = "0" ] && [ -n "$GCS_KEY_FILE" ] && [ -n "$GCS_BUCKET" ]; then
   colab upload -s "$SESSION" "$GCS_KEY_FILE" /tmp/gcs-key.json
-  GCS_BUCKET="${MAYA_GCS_BUCKET:-$(cat "$HOME/.config/maya-gcs/bucket" "$RES_DIR/gcs-bucket" 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)}"
-  if [ -n "$GCS_BUCKET" ]; then
-    TMP_BUCKET="/tmp/maya-gcs-bucket.$$"
-    umask 077
-    printf '%s\n' "$GCS_BUCKET" > "$TMP_BUCKET"
-    colab upload -s "$SESSION" "$TMP_BUCKET" /tmp/gcs-bucket
-    rm -f "$TMP_BUCKET"
-  fi
+  TMP_BUCKET="/tmp/maya-gcs-bucket.$$"
+  umask 077
+  printf '%s\n' "$GCS_BUCKET" > "$TMP_BUCKET"
+  colab upload -s "$SESSION" "$TMP_BUCKET" /tmp/gcs-bucket
+  rm -f "$TMP_BUCKET"
 fi
 
 HF_TOKEN_FILE=""
@@ -85,14 +88,15 @@ elif [ -n "${MAYA_API_KEY:-}" ]; then
   rm -f "$TMP_API"
 fi
 
-echo "[Mac] 正在启动远端自动拉取与部署流程..."
-colab exec -s "$SESSION" --timeout 1800 << 'EOF'
+echo "[Mac] 正在启动远端自动拉取与部署流程 (MAYA_S2_GCS_DISABLE=${MAYA_S2_GCS_DISABLE})..."
+colab exec -s "$SESSION" --timeout 1800 << EOF
 !mkdir -p /content/project-maya
 !tar -xzf /tmp/maya-g4-runtime.tar.gz -C /content/project-maya/
 !cp -f /tmp/maya-ds4.json /content/project-maya/maya-ds4.json
 !cp -f /tmp/pack-meta-256g.tar.gz /content/project-maya/pack-meta-256g.tar.gz
 !chmod +x /tmp/start_g4_256g.sh
-!bash /tmp/start_g4_256g.sh
+!if [ "${MAYA_S2_GCS_DISABLE}" != "0" ]; then rm -f /tmp/gcs-key.json /tmp/gcs-bucket; fi
+!MAYA_S2_GCS_DISABLE=${MAYA_S2_GCS_DISABLE} bash /tmp/start_g4_256g.sh
 EOF
 
 echo "[Mac] 正在后台启动 Colab Jupyter 内核防休眠保活与可选本地配置同步守护..."

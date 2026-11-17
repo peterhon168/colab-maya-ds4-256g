@@ -30,11 +30,11 @@
 
 ## 核心特性
 
-1. **Mode B1 零冷启 GCS 流量 + 双模突发加速架构**
+1. **Mode B1-Pure 零云存储默认架构 + 可选同区 GCS 双模突发加速**
    - **`Shards 1–4` 直走 Hugging Face Xet (`~305 MiB/s`, `$0`)**：直接写入云端实例本地 NVMe，彻底绕过 DriveFS 阻塞与按 GB 计费的启动期 GCS 出网流量。
    - **`Shards 5–7` 挂载 `/mnt/hf` (`hf_ro_fuse` FUSE3 + HTTPS HTTP/2 Range)**：大于 `256 KB` 的读取与 `2 MB` 头部窗口直连 HF CDN，零本地落盘且 `$0/GB` 流量费。
-   - **`Shard 00002` `mincore()` 页缓存分级调度 + 可选 GCS 双模突发**：低并发 Decode（`tot <= 160`）100% 走本地 NVMe（零网络 RTT，`~42–66 tok/s`）；高并发 Prefill 突发（`tot > 160` 且配置了同区 GCS 凭据）自动切流 `752 线程 -> 8x8 HTTP/2 curl_multi`，在 `78K–106K` 超长上下文下仍可维持数百 `tok/s` 预填充吞吐。
-   - 提供 **5 种部署模式一键切换**：`Mode B1`（默认推荐）、`Mode B1-Pure`（`MAYA_S2_GCS_DISABLE=1`，完全不依赖 GCS）、`Mode A`（A100 双盘直读）、`Mode B1-GCS`、`Mode B2`（`/dev/shm` `110G` 内存盘无凭据兜底）。
+   - **`Shard 00002` 默认纯本地零云存储（`Mode B1-Pure`）+ 可选同区 GCS 突发加速（`Mode B1`）**：默认启用 `MAYA_S2_GCS_DISABLE=1`，`Shard 00002` 与低并发 Decode（`~42–66 tok/s`）100% 走本地 NVMe，**零云存储月租、零跨区流量费**；仅在配置了与 Colab 实例**同单区域**的 GCS 桶且显式切换到 `Mode B1` 时，才对高并发 Prefill 突发（`tot > 160`）启用 `752 线程 -> 8x8 HTTP/2 curl_multi` 加速（若启用可选 GCS 桶，请务必选择 `us-central1` / `us-east4` 等单区域桶，切勿选 `us` Multi-Region 以防跨区出站计费）。
+   - 提供 **5 种部署模式一键切换**：`Mode B1-Pure`（**默认推荐**，`MAYA_S2_GCS_DISABLE=1`，完全零 GCS 依赖）、`Mode B1`（可选同单区域 GCS 突发加速）、`Mode A`（A100 双盘直读）、`Mode B1-GCS`、`Mode B2`（`/dev/shm` `110G` 内存盘无凭据兜底）。
 
 2. **EasyColab 风格三栏式云端推理工作台（原生 macOS `.app` + 跨平台 WebUI）**
    - **顶部全局栏**：实时显示引擎在线徽标、当前引擎 (`Project Maya` / `Strata Engine`)、GPU 型号、`示例接入指南`、外部浏览器直开、`中 / EN` 实时切换、以及 **录屏隐私打码 (`👁️ ON/OFF`)**（一键遮蔽邮箱、Bucket 名称与 `*.trycloudflare.com` 子域名）。在 `MayaStudio.app` 原生壳（`?shell=macos`）下自动为左侧红绿灯按钮预留安全边距。
@@ -136,12 +136,12 @@ flowchart LR
 mkdir -p ~/.config/maya-gcs
 chmod 700 ~/.config/maya-gcs
 
-# 1. Hugging Face Token（Mode B1 零冷启推荐）
+# 1. Hugging Face Token（默认推荐 Mode B1-Pure 纯 HF 零云存储所需唯一凭据）
 echo "hf_your_huggingface_token" > ~/.config/maya-gcs/hf-token
 
-# 2. 可选：同区域 GCS 服务账号与桶名（启用 >160 并发 Prefill HTTP/2 突发加速）
+# 2. 可选：同单区域 GCS 服务账号与桶名（仅切换到 Mode B1 启用 >160 突发加速时使用；请选与 Colab VM 同单区域，切勿用 us Multi-Region；CLI 部署需显式 MAYA_S2_GCS_DISABLE=0）
 cp /path/to/your-gcs-service-account.json ~/.config/maya-gcs/gcs-key.json
-echo "your-gcs-bucket-name" > ~/.config/maya-gcs/bucket
+echo "your-single-region-gcs-bucket" > ~/.config/maya-gcs/bucket
 
 # 3. 可选：公网网关鉴权密钥（也可稍后在 Studio 界面点击“随机生成”）
 echo "sk-maya-your-strong-random-key" > ~/.config/maya-gcs/maya-api-key
