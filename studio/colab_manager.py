@@ -629,65 +629,77 @@ def _fmt_duration(seconds: float) -> str:
 
 def _parse_maya_warmup_lines(lines: list[str], ram_track: dict[str, float]) -> dict[str, Any] | None:
     """Parse latest VRAM/RAM expert loading or initialization progress from maya-ds4.log."""
-    for ln in reversed(lines):
+    last_ram: re.Match[str] | None = None
+    last_vram: re.Match[str] | None = None
+    last_start_sec: int | None = None
+    for ln in lines:
         s = (ln or "").strip()
         if not s:
             continue
         m_ram = re.search(r"ds4:\s*copying experts\s*(\d+)\s*/\s*(\d+)\s*\(([^)]+)\)", s)
         if m_ram:
-            x = int(m_ram.group(1))
-            y = max(1, int(m_ram.group(2)))
-            info = m_ram.group(3)
-            frac = min(1.0, x / y)
-            pct = round(74.0 + 25.0 * frac, 1)
-            sub_pct = round(100.0 * frac, 1)
-            now = time.monotonic()
-            if "x0" not in ram_track:
-                ram_track["x0"] = float(x)
-                ram_track["t0"] = now
-            dt = now - ram_track.get("t0", now)
-            dx = x - ram_track.get("x0", float(x))
-            if dx > 0 and dt > 3.0:
-                rate = dx / dt
-                rem_s = max(5.0, (y - x) / rate + 15.0)
-            else:
-                rem_s = max(10.0, (1.0 - frac) * 620.0 + 15.0)
-            return {
-                "percent": pct,
-                "sub_percent": sub_pct,
-                "label": f"正在装入 RAM 专家权重 ({sub_pct:.0f}%)",
-                "detail": f"RAM 专家: {x:,} / {y:,} ({info})",
-                "eta_text": f"预计剩余 ~{_fmt_duration(rem_s)}",
-            }
-
+            last_ram = m_ram
         m_vram = re.search(r"ds4:\s*experts\s*(\d+)\s*/\s*(\d+)\s*\(([^)]+)\)", s)
         if m_vram:
-            x = int(m_vram.group(1))
-            y = max(1, int(m_vram.group(2)))
-            info = m_vram.group(3)
-            frac = min(1.0, x / y)
-            pct = round(59.0 + 15.0 * frac, 1)
-            sub_pct = round(100.0 * frac, 1)
-            rem_s = max(15.0, (1.0 - frac) * 260.0 + 580.0)
-            return {
-                "percent": pct,
-                "sub_percent": sub_pct,
-                "label": f"正在装入 VRAM 专家权重 ({sub_pct:.0f}%)",
-                "detail": f"VRAM 专家: {x:,} / {y:,} ({info})",
-                "eta_text": f"VRAM 装入中 · 预计总剩余 ~{_fmt_duration(rem_s)}",
-            }
-
+            last_vram = m_vram
         m_start = re.search(r"\[maya\]\s*still starting\s*\((\d+)\s*s\)", s)
         if m_start:
-            sec = int(m_start.group(1))
-            pct = round(min(58.8, 56.0 + sec / 65.0), 1)
-            return {
-                "percent": pct,
-                "sub_percent": None,
-                "label": f"引擎正在初始化与校验分片 ({sec}s)...",
-                "detail": "校验 GGUF 索引并分配 96GB 显存空间",
-                "eta_text": "权重装载阶段预计 ~14–18 分钟",
-            }
+            last_start_sec = int(m_start.group(1))
+
+    wait_suffix = f" · 已等待 {last_start_sec}s" if last_start_sec is not None else ""
+
+    # 严格按阶段优先级返回：RAM 拷贝 > VRAM 装载 > 初始化心跳，避免每 20s 一次的 still starting 心跳倒退覆盖真实专家进度
+    if last_ram is not None:
+        x = int(last_ram.group(1))
+        y = max(1, int(last_ram.group(2)))
+        info = last_ram.group(3)
+        frac = min(1.0, x / y)
+        pct = round(74.0 + 25.0 * frac, 1)
+        sub_pct = round(100.0 * frac, 1)
+        now = time.monotonic()
+        if "x0" not in ram_track:
+            ram_track["x0"] = float(x)
+            ram_track["t0"] = now
+        dt = now - ram_track.get("t0", now)
+        dx = x - ram_track.get("x0", float(x))
+        if dx > 0 and dt > 3.0:
+            rate = dx / dt
+            rem_s = max(5.0, (y - x) / rate + 15.0)
+        else:
+            rem_s = max(10.0, (1.0 - frac) * 620.0 + 15.0)
+        return {
+            "percent": pct,
+            "sub_percent": sub_pct,
+            "label": f"正在装入 RAM 专家权重 ({sub_pct:.0f}%)",
+            "detail": f"RAM 专家: {x:,} / {y:,} ({info}){wait_suffix}",
+            "eta_text": f"预计剩余 ~{_fmt_duration(rem_s)}",
+        }
+
+    if last_vram is not None:
+        x = int(last_vram.group(1))
+        y = max(1, int(last_vram.group(2)))
+        info = last_vram.group(3)
+        frac = min(1.0, x / y)
+        pct = round(59.0 + 15.0 * frac, 1)
+        sub_pct = round(100.0 * frac, 1)
+        rem_s = max(15.0, (1.0 - frac) * 260.0 + 580.0)
+        return {
+            "percent": pct,
+            "sub_percent": sub_pct,
+            "label": f"正在装入 VRAM 专家权重 ({sub_pct:.0f}%)",
+            "detail": f"VRAM 专家: {x:,} / {y:,} ({info}){wait_suffix}",
+            "eta_text": f"VRAM 装入中 · 预计总剩余 ~{_fmt_duration(rem_s)}",
+        }
+
+    if last_start_sec is not None:
+        pct = round(min(58.8, 56.0 + last_start_sec / 65.0), 1)
+        return {
+            "percent": pct,
+            "sub_percent": None,
+            "label": f"引擎正在初始化与校验分片 ({last_start_sec}s)...",
+            "detail": "校验 GGUF 索引并分配 96GB 显存空间",
+            "eta_text": "权重装载阶段预计 ~14–18 分钟",
+        }
     return None
 
 
@@ -872,11 +884,11 @@ class ColabManager:
             return snap
 
     def mark_warming_ready_if_idle_deploy(self) -> None:
-        """Promote attached warming state to ready once telemetry confirms engine is loaded."""
+        """Promote attached warming or timed-out error state to ready once telemetry confirms engine is loaded."""
         with self._lock:
             deploy_busy = self._deploy_thread is not None and self._deploy_thread.is_alive()
             phase = str(self._deployment.get("phase") or "")
-        if not deploy_busy and phase == "warming":
+        if not deploy_busy and phase in ("warming", "error"):
             self._set_deployment(
                 phase="ready",
                 step_index=6,
@@ -885,6 +897,7 @@ class ColabManager:
                 sub_percent=100.0,
                 detail="云端引擎已就绪在线",
                 eta_text="已完成",
+                error="",
             )
 
     def _set_deployment(
@@ -1423,6 +1436,35 @@ class ColabManager:
         if rc != 0:
             raise RuntimeError(f"上传 {local_path.name} 失败: {(err or out).strip()[-300:]}")
 
+    def _probe_vm_region(self, session: str) -> dict[str, str]:
+        """Query non-sensitive Colab VM city/region/country via ipinfo without logging any IP."""
+        if not self.colab_bin:
+            return {}
+        probe_py = (
+            "import json, urllib.request\n"
+            "try:\n"
+            "    with urllib.request.urlopen('https://ipinfo.io/json', timeout=4) as r:\n"
+            "        d = json.loads(r.read().decode('utf-8', 'replace'))\n"
+            "    out = {k: str(d.get(k) or '').strip() for k in ('city', 'region', 'country')}\n"
+            "    print('STUDIO_LOC_JSON:' + json.dumps(out, ensure_ascii=False))\n"
+            "except Exception:\n"
+            "    pass\n"
+        )
+        try:
+            rc, out, _ = self._run_bounded(
+                [self.colab_bin, "exec", "-s", session, "--timeout", "10"],
+                stdin_data=probe_py,
+                timeout=12.0,
+            )
+            if rc != 0:
+                return {}
+            parsed = _extract_marked_json(out, "STUDIO_LOC_JSON:")
+            if isinstance(parsed, dict):
+                return {k: str(parsed.get(k) or "").strip() for k in ("city", "region", "country")}
+        except Exception:
+            pass
+        return {}
+
     def _deploy_worker(self, gpu: str, session: str, engine_kind: str, mode_id: str) -> None:
         try:
             self.logs.emit("deploy", "info", f"[1/6] 开始部署 {engine_kind} ({mode_id}) 至 Colab '{session}' ({gpu})...")
@@ -1445,6 +1487,20 @@ class ColabManager:
                     raise RuntimeError((err or out).strip()[-300:] or "colab new 失败")
             else:
                 raise RuntimeError("未检测到 colab CLI 或 colab_cli 运行环境")
+
+            # 开机第一时间探测机房地区，便于跨洲慢机房提前预警（不记录任何公网 IP）
+            loc = self._probe_vm_region(session)
+            country = str(loc.get("country") or "").strip().upper()
+            loc_label = ", ".join(p for p in (loc.get("city", ""), loc.get("region", ""), loc.get("country", "")) if p)
+            if country:
+                if country == "US":
+                    self.logs.emit("deploy", "info", f"[1/6] 已分配 Colab 实例机房: {loc_label}（美区近源，HF CDN 冷启高速）")
+                else:
+                    self.logs.emit(
+                        "deploy",
+                        "warn",
+                        f"[1/6] 已分配 Colab 实例机房: {loc_label}（非美区跨洲节点，拉取美区 HF CDN 冷启可能需 35–55 分钟；加载完成后推理不受影响，如需快速冷启可立即释放重抽美区节点）",
+                    )
 
             # Step 2: Upload runtime packages & credentials from ~/.config/maya-gcs/
             self._set_deployment(
@@ -1807,7 +1863,7 @@ class ColabManager:
         """Wait until the remote engine finishes loading experts into VRAM/RAM and serves :8000."""
         self.logs.emit("deploy", "info", "[6/6] 隧道已建立，正在等待远端引擎完成权重装入并监听 :8000...")
         api_key = self.config.read_credential_file("strata_api_key" if engine_kind == "strata" else "maya_api_key")
-        deadline = time.monotonic() + 2400.0
+        deadline = time.monotonic() + 3600.0
         last_log_check = 0.0
         last_label = ""
         ram_track: dict[str, float] = {}
@@ -1815,7 +1871,7 @@ class ColabManager:
             "from pathlib import Path\n"
             "p = Path('/content/project-maya/maya-ds4.log')\n"
             "if p.is_file():\n"
-            "    print('\\n'.join(p.read_text(errors='replace').splitlines()[-40:]))\n"
+            "    print('\\n'.join(p.read_text(errors='replace').splitlines()[-200:]))\n"
         )
 
         while time.monotonic() < deadline:
@@ -1865,7 +1921,7 @@ class ColabManager:
 
             time.sleep(5.0)
 
-        raise RuntimeError("等待远端引擎加载权重超时 (40m)，请查看远端 maya-ds4.log")
+        raise RuntimeError("等待远端引擎加载权重超时 (60m)，请查看远端 maya-ds4.log")
 
     def _launch_strata_on_colab(self, session: str, settings: dict[str, Any]) -> None:
         """Start Strata mode via serve/server.py --engine strata when requested on Colab."""

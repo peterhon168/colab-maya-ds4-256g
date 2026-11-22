@@ -316,6 +316,7 @@
     pollInFlight: false,
     eventSource: null,
     iframeLoadTimer: null,
+    rawSnippets: { pi: "", cursor: "", claude: "", openai: "" },
   };
 
   const $ = (id) => document.getElementById(id);
@@ -854,74 +855,84 @@
     const useLocal = $("chkUseLocalProxy") ? $("chkUseLocalProxy").checked : true;
     const rawUp = state?.engine?.upstream_url || "";
     const maskedUp = state?.engine?.upstream_masked || (rawUp ? maskUrl(rawUp) : "");
-    const activeUpstream = ui.privacyMask ? maskedUp : (rawUp || maskedUp);
-    const openaiBase = !useLocal && activeUpstream ? `${activeUpstream.replace(/\/+$/, "")}/v1` : getOpenAIBaseUrl(state);
-    const proxyRoot = !useLocal && activeUpstream ? activeUpstream.replace(/\/+$/, "") : getProxyBaseUrl(state);
+    const displayUpstream = ui.privacyMask ? maskedUp : (rawUp || maskedUp);
+    const copyUpstream = rawUp || maskedUp;
     const modelId = state?.engine?.model_id || state?.settings?.strata_model || "deepseek-v4.1-flash-abliterated";
     const maxCtx = Number(state?.settings?.strata_max_context || state?.settings?.max_context || 262144);
     const hasApiKey = Boolean(state?.engine?.has_api_key);
     const apiKeyHint = !useLocal && hasApiKey ? "sk-maya-******" : "studio-local-proxy";
 
-    const piJson = JSON.stringify(
-      {
-        providers: {
-          "maya-studio": {
-            baseUrl: openaiBase,
-            api: "openai-completions",
-            apiKey: apiKeyHint,
-            models: [
-              {
-                id: modelId,
-                name: `Maya Studio (${modelId})`,
-                reasoning: true,
-                input: ["text", "image"],
-                contextWindow: maxCtx,
-                maxTokens: 65536,
-              },
-            ],
+    const buildSnippetsForUpstream = (upstreamValue) => {
+      const openaiBase = !useLocal && upstreamValue ? `${upstreamValue.replace(/\/+$/, "")}/v1` : getOpenAIBaseUrl(state);
+      const proxyRoot = !useLocal && upstreamValue ? upstreamValue.replace(/\/+$/, "") : getProxyBaseUrl(state);
+
+      const pi = JSON.stringify(
+        {
+          providers: {
+            "maya-studio": {
+              baseUrl: openaiBase,
+              api: "openai-completions",
+              apiKey: apiKeyHint,
+              models: [
+                {
+                  id: modelId,
+                  name: `Maya Studio (${modelId})`,
+                  reasoning: true,
+                  input: ["text", "image"],
+                  contextWindow: maxCtx,
+                  maxTokens: 65536,
+                },
+              ],
+            },
           },
         },
-      },
-      null,
-      2
-    );
+        null,
+        2
+      );
 
-    const cursorJson = JSON.stringify(
-      {
-        "openai.baseUrl": openaiBase,
-        "openai.apiKey": apiKeyHint,
-        "openai.model": modelId,
-      },
-      null,
-      2
-    );
+      const cursor = JSON.stringify(
+        {
+          "openai.baseUrl": openaiBase,
+          "openai.apiKey": apiKeyHint,
+          "openai.model": modelId,
+        },
+        null,
+        2
+      );
 
-    const claudeShell = [
-      `export ANTHROPIC_BASE_URL="${proxyRoot}"`,
-      `export ANTHROPIC_AUTH_TOKEN="${apiKeyHint}"`,
-      `export ANTHROPIC_MODEL="${modelId}"`,
-    ].join("\n");
+      const claude = [
+        `export ANTHROPIC_BASE_URL="${proxyRoot}"`,
+        `export ANTHROPIC_AUTH_TOKEN="${apiKeyHint}"`,
+        `export ANTHROPIC_MODEL="${modelId}"`,
+      ].join("\n");
 
-    const openaiPy = [
-      "from openai import OpenAI",
-      "",
-      "client = OpenAI(",
-      `    base_url="${openaiBase}",`,
-      `    api_key="${apiKeyHint}",`,
-      ")",
-      "resp = client.chat.completions.create(",
-      `    model="${modelId}",`,
-      '    messages=[{"role": "user", "content": "Hello"}],',
-      "    max_tokens=256,",
-      ")",
-      "print(resp.choices[0].message.content)",
-    ].join("\n");
+      const openai = [
+        "from openai import OpenAI",
+        "",
+        "client = OpenAI(",
+        `    base_url="${openaiBase}",`,
+        `    api_key="${apiKeyHint}",`,
+        ")",
+        "resp = client.chat.completions.create(",
+        `    model="${modelId}",`,
+        '    messages=[{"role": "user", "content": "Hello"}],',
+        "    max_tokens=256,",
+        ")",
+        "print(resp.choices[0].message.content)",
+      ].join("\n");
+
+      return { pi, cursor, claude, openai };
+    };
+
+    const displaySnippets = buildSnippetsForUpstream(displayUpstream);
+    // 剪贴板片段始终保留未打码的真实上游 URL（前台打码仅作用于屏幕 DOM 展示）
+    ui.rawSnippets = buildSnippetsForUpstream(copyUpstream);
 
     const map = {
-      snippetPi: piJson,
-      snippetCursor: cursorJson,
-      snippetClaude: claudeShell,
-      snippetOpenai: openaiPy,
+      snippetPi: displaySnippets.pi,
+      snippetCursor: displaySnippets.cursor,
+      snippetClaude: displaySnippets.claude,
+      snippetOpenai: displaySnippets.openai,
     };
     Object.entries(map).forEach(([id, content]) => {
       const node = $(id);
@@ -2027,11 +2038,9 @@
       tabBtn.addEventListener("click", () => switchTab(tabBtn.dataset.tab || "console"));
     });
 
-    // Copy Address Pills
+    // Copy Address Pills (decoupled from privacy mask: clipboard always receives real unmasked URL)
     $("btnCopyUpstream")?.addEventListener("click", () => {
-      const up = ui.privacyMask
-        ? (ui.lastState?.engine?.upstream_masked || maskUrl(ui.lastState?.engine?.upstream_url || ""))
-        : (ui.lastState?.engine?.upstream_url || ui.lastState?.engine?.upstream_masked || "");
+      const up = ui.lastState?.engine?.upstream_url || "";
       copyToClipboard(up, ui.lang === "zh" ? "上游地址" : "Upstream URL");
     });
 
@@ -2069,6 +2078,15 @@
           if (data.snippets.cursor && $("snippetCursor")) $("snippetCursor").textContent = maskText(data.snippets.cursor);
           if (data.snippets.claude_code && $("snippetClaude")) $("snippetClaude").textContent = maskText(data.snippets.claude_code);
           if (data.snippets.openai_python && $("snippetOpenai")) $("snippetOpenai").textContent = maskText(data.snippets.openai_python);
+          const hasMaskedTunnel = String(data.snippets.pi || "").includes("******.trycloudflare.com");
+          if (useLocal || !hasMaskedTunnel) {
+            ui.rawSnippets = {
+              pi: data.snippets.pi || ui.rawSnippets.pi,
+              cursor: data.snippets.cursor || ui.rawSnippets.cursor,
+              claude: data.snippets.claude_code || ui.rawSnippets.claude,
+              openai: data.snippets.openai_python || ui.rawSnippets.openai,
+            };
+          }
         }
         const box = $("piSyncResultBox");
         if (box) {
@@ -2093,13 +2111,14 @@
     $("btnSyncPiPanel")?.addEventListener("click", () => runSyncPi($("btnSyncPiPanel")));
     $("chkUseLocalProxy")?.addEventListener("change", () => renderSnippets(ui.lastState));
 
-    // Copy Snippets
+    // Copy Snippets (decoupled from privacy mask: prefer unmasked rawSnippets)
     document.querySelectorAll(".copy-snippet-btn").forEach((btn) => {
       btn.addEventListener("click", () => {
         const type = btn.dataset.snippet;
         const map = { pi: "snippetPi", cursor: "snippetCursor", claude: "snippetClaude", openai: "snippetOpenai" };
         const el = $(map[type]);
-        copyToClipboard(el?.textContent || "", type?.toUpperCase());
+        const text = (type && ui.rawSnippets && ui.rawSnippets[type]) || el?.textContent || "";
+        copyToClipboard(text, type?.toUpperCase());
       });
     });
 
