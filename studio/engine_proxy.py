@@ -864,12 +864,13 @@ def fetch_engine_telemetry(
     engine_kind: str = "maya",
     api_key: str = "",
     strata_model: str = "",
-    timeout: float = 2.5,
+    timeout: float = 6.0,
 ) -> dict[str, Any]:
     """Poll /health, /metrics, /status, /v1/models and normalize Maya or Strata telemetry."""
     empty: dict[str, Any] = {
         "online": False,
         "loaded": False,
+        "has_metrics": False,
         "model_id": strata_model if engine_kind == "strata" and strata_model else "",
         "telemetry": {
             "requests_total": None,
@@ -932,16 +933,20 @@ def fetch_engine_telemetry(
     except Exception:
         pass
 
+    has_model_hint = bool(health_data and health_data.get("model")) or bool(
+        metrics_json and isinstance(metrics_json.get("engine"), dict) and metrics_json["engine"].get("model")
+    )
     models_data: dict[str, Any] | None = None
-    try:
-        st, _, raw = _fetch_upstream(upstream_url, "/v1/models", api_key=api_key, timeout=timeout)
-        if st == 200:
-            online = True
-            parsed = _parse_json_safe(raw)
-            if isinstance(parsed, dict):
-                models_data = parsed
-    except Exception:
-        pass
+    if not has_model_hint:
+        try:
+            st, _, raw = _fetch_upstream(upstream_url, "/v1/models", api_key=api_key, timeout=timeout)
+            if st == 200:
+                online = True
+                parsed = _parse_json_safe(raw)
+                if isinstance(parsed, dict):
+                    models_data = parsed
+        except Exception:
+            pass
 
     if not online:
         return empty
@@ -1136,6 +1141,7 @@ def fetch_engine_telemetry(
     return {
         "online": online,
         "loaded": loaded,
+        "has_metrics": bool(metrics_json or metrics_prom),
         "model_id": model_id,
         "telemetry": {
             "requests_total": requests_total,

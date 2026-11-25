@@ -131,9 +131,12 @@ class StudioRuntime:
         self.proxy.deployment_getter = self.colab.get_deployment_snapshot
 
         self._tel_lock = threading.RLock()
+        self._tel_fail_streak: int = 0
+        self._tel_upstream: str = ""
         self._telemetry: dict[str, Any] = {
             "online": False,
             "loaded": False,
+            "has_metrics": False,
             "model_id": "",
             "telemetry": {
                 "requests_total": None,
@@ -191,10 +194,31 @@ class StudioRuntime:
             engine_kind=kind,
             api_key=api_key,
             strata_model=str(settings.get("strata_model") or ""),
-            timeout=2.5,
+            timeout=6.0,
         )
         with self._tel_lock:
-            self._telemetry = snap
+            same_upstream = bool(upstream) and (upstream == self._tel_upstream)
+            if not upstream or not same_upstream:
+                self._tel_upstream = upstream
+                self._tel_fail_streak = 0
+                self._telemetry = snap
+            elif snap.get("online"):
+                self._tel_fail_streak = 0
+                prev_tel = self._telemetry.get("telemetry") if isinstance(self._telemetry.get("telemetry"), dict) else {}
+                prev_has_data = prev_tel.get("requests_total") is not None or bool(prev_tel.get("recent_requests"))
+                if not snap.get("has_metrics") and self._telemetry.get("online") and prev_has_data:
+                    # /health 通了但 /metrics 偶发超时时保留上次遥测，防止 KPI 与请求表闪回 "--"
+                    snap["telemetry"] = dict(prev_tel)
+                self._telemetry = snap
+            else:
+                if self._telemetry.get("online"):
+                    self._tel_fail_streak += 1
+                    if self._tel_fail_streak < 3:
+                        # 同一上游偶发单/双次隧道抖动超时，暂保在线与历史遥测，连续 3 次失联才判离线
+                        effective = dict(self._telemetry)
+                        effective["telemetry"] = dict(self._telemetry.get("telemetry") or {})
+                        return effective
+                self._telemetry = snap
         if snap.get("online") and (kind == "strata" or snap.get("loaded")):
             self.colab.mark_warming_ready_if_idle_deploy()
         return snap
