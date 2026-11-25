@@ -256,6 +256,29 @@ body.shell-macos .topbar {
   font-size: 11px;
 }
 
+.region-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 9px;
+  border-radius: var(--radius-pill);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.region-chip--us {
+  background: rgba(16, 185, 129, 0.12);
+  border: 1px solid rgba(16, 185, 129, 0.34);
+  color: #6EE7B7;
+}
+
+.region-chip--intl {
+  background: rgba(245, 158, 11, 0.12);
+  border: 1px solid rgba(245, 158, 11, 0.36);
+  color: #FCD34D;
+}
+
 .top-btn {
   display: inline-flex;
   align-items: center;
@@ -909,6 +932,11 @@ body.shell-macos .topbar {
 .mount-pill--ok {
   border-color: rgba(16, 185, 129, 0.35);
   color: #6EE7B7;
+}
+
+.mount-pill--warn {
+  border-color: rgba(245, 158, 11, 0.4);
+  color: #FCD34D;
 }
 
 .card-footer-danger {

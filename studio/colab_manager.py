@@ -410,6 +410,7 @@ result = {
     "tunnel_url": "",
     "local_health": None,
     "maya_log_tail": [],
+    "vm_region": {},
 }
 
 try:
@@ -518,6 +519,14 @@ if os.path.isfile("/content/project-maya/maya-ds4.log"):
             result["maya_log_tail"] = [ln.rstrip() for ln in mf.readlines()[-30:]]
     except Exception:
         pass
+
+try:
+    with urllib.request.urlopen("https://ipinfo.io/json", timeout=3) as _r:
+        _loc = json.loads(_r.read().decode("utf-8", "replace"))
+    if isinstance(_loc, dict) and _loc.get("country"):
+        result["vm_region"] = {k: str(_loc.get(k) or "").strip() for k in ("city", "region", "country")}
+except Exception:
+    pass
 
 print("STUDIO_PROBE_JSON:" + json.dumps(result, ensure_ascii=False))
 '''
@@ -703,6 +712,101 @@ def _parse_maya_warmup_lines(lines: list[str], ram_track: dict[str, float]) -> d
     return None
 
 
+_COUNTRY_ZH_MAP: dict[str, str] = {
+    "US": "美国",
+    "NL": "荷兰",
+    "IN": "印度",
+    "BE": "比利时",
+    "DE": "德国",
+    "GB": "英国",
+    "JP": "日本",
+    "SG": "新加坡",
+    "TW": "中国台湾",
+    "FR": "法国",
+    "CA": "加拿大",
+    "AU": "澳大利亚",
+    "FI": "芬兰",
+    "CH": "瑞士",
+    "PL": "波兰",
+    "KR": "韩国",
+    "BR": "巴西",
+}
+
+
+def _country_flag(code: str) -> str:
+    """Convert a 2-letter ISO country code into its Unicode flag emoji."""
+    cc = (code or "").strip().upper()
+    if len(cc) == 2 and cc.isascii() and cc.isalpha():
+        return "".join(chr(0x1F1E6 + ord(ch) - ord("A")) for ch in cc)
+    return "🌐"
+
+
+def _format_vm_region(loc: Any) -> dict[str, Any]:
+    """Normalize non-sensitive Colab VM city/region/country metadata for UI badges and logs."""
+    if not isinstance(loc, dict):
+        return {}
+    country = str(loc.get("country") or "").strip().upper()
+    if not country:
+        return {}
+    city = str(loc.get("city") or "").strip()
+    region = str(loc.get("region") or "").strip()
+    flag = _country_flag(country)
+    country_zh = _COUNTRY_ZH_MAP.get(country, country)
+    is_us = country == "US"
+    short_label = f"{flag} {country_zh} · {city}" if city else f"{flag} {country_zh}"
+    short_label_en = f"{flag} {country} · {city}" if city else f"{flag} {country}"
+    full_label = ", ".join(p for p in (city, region, country) if p)
+    return {
+        "country": country,
+        "country_zh": country_zh,
+        "city": city,
+        "region": region,
+        "flag": flag,
+        "is_us": is_us,
+        "short_label": short_label,
+        "short_label_en": short_label_en,
+        "full_label": full_label,
+    }
+
+
+def _is_retryable_assign_error(err: str) -> bool:
+    """Return True when Colab allocation failure looks like transient capacity/timeout rather than a hard error."""
+    msg = (err or "").strip().lower()
+    if not msg:
+        return False
+    hard_markers = (
+        "toomanyassignmentserror",
+        "412",
+        "尚未登录",
+        "oauth",
+        "401",
+        "403",
+        "400",
+        "bad request",
+        "quota",
+        "余额不足",
+        "不支持的 gpu",
+    )
+    if any(m in msg for m in hard_markers):
+        return False
+    retryable_markers = (
+        "assignment request failed",
+        "retrying in",
+        "timed out",
+        "readtimeout",
+        "timeout",
+        "502",
+        "503",
+        "504",
+        "capacity",
+        "temporarily",
+        "unavailable",
+        "connectionerror",
+        "remotedisconnected",
+    )
+    return any(m in msg for m in retryable_markers)
+
+
 def _is_health_ready(health: Any) -> bool:
     if not isinstance(health, dict) or not health:
         return False
@@ -747,6 +851,7 @@ class ColabManager:
             "selected_session": config.selected_session,
             "gpu_name": "",
             "mounts": {},
+            "vm_region": {},
         }
         self._deployment: dict[str, Any] = {
             "phase": "idle",
@@ -793,9 +898,12 @@ class ColabManager:
         *,
         stdin_data: str | None = None,
         timeout: float = 45.0,
+        extra_env: dict[str, str] | None = None,
     ) -> tuple[int, str, str]:
         """Run a subprocess in its own session and kill its process group on timeout."""
         env = self._build_subprocess_env()
+        if extra_env:
+            env.update(extra_env)
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE if stdin_data is not None else None,
@@ -816,10 +924,19 @@ class ColabManager:
             out, err = proc.communicate()
             return 124, out or "", (err or "") + f"\nCommand timed out after {timeout}s"
 
-    def _run_bridge(self, *args: str, timeout: float = 35.0) -> dict[str, Any] | None:
+    def _run_bridge(
+        self,
+        *args: str,
+        timeout: float = 35.0,
+        extra_env: dict[str, str] | None = None,
+    ) -> dict[str, Any] | None:
         if not self.colab_python:
             return None
-        rc, out, err = self._run_bounded([self.colab_python, "-c", _BRIDGE_HELPER_SCRIPT, *args], timeout=timeout)
+        rc, out, err = self._run_bounded(
+            [self.colab_python, "-c", _BRIDGE_HELPER_SCRIPT, *args],
+            timeout=timeout,
+            extra_env=extra_env,
+        )
         parsed = _extract_marked_json(out, BRIDGE_MARKER)
         if parsed is not None:
             return parsed
@@ -995,6 +1112,7 @@ class ColabManager:
                 if not deploy_busy:
                     self._colab_state["gpu_name"] = ""
                     self._colab_state["mounts"] = {}
+                    self._colab_state["vm_region"] = {}
                     if self.config.engine_kind == "maya":
                         if str(self._deployment.get("phase") or "") in ("ready", "warming"):
                             self._set_deployment(
@@ -1116,6 +1234,7 @@ class ColabManager:
                     "sessions": [],
                     "gpu_name": "",
                     "mounts": {},
+                    "vm_region": {},
                 }
             )
         self.logs.emit("colab", "info", "已退出当前 Google Colab OAuth 会话")
@@ -1157,6 +1276,7 @@ class ColabManager:
         gpu_name = str(probe.get("gpu_name") or "")
         processes = probe.get("processes") if isinstance(probe.get("processes"), dict) else {}
         mounts = probe.get("mounts") if isinstance(probe.get("mounts"), dict) else {}
+        vm_region = _format_vm_region(probe.get("vm_region"))
         tunnel_url = str(probe.get("tunnel_url") or "").strip().rstrip("/")
         keepalive_running = self.is_keepalive_running(sess)
 
@@ -1177,6 +1297,8 @@ class ColabManager:
         with self._lock:
             self._colab_state["gpu_name"] = gpu_name
             self._colab_state["mounts"] = mounts
+            if vm_region:
+                self._colab_state["vm_region"] = vm_region
             self._colab_state["keepalive_running"] = keepalive_running
             self._colab_state["selected_session"] = sess
             if inferred_gpu:
@@ -1235,10 +1357,11 @@ class ColabManager:
                             detail="远端引擎已启动，等待开放 :8000",
                             eta_text="权重装载阶段预计 ~14–18 分钟",
                         )
+            region_note = f", region={vm_region['short_label']}" if vm_region else ""
             self.logs.emit(
                 "colab",
                 "success",
-                f"无损纳管 '{sess}' 成功: GPU={gpu_name or 'unknown'}, 隧道已绑定本地代理 :{self.proxy.proxy_port}, keepalive={keepalive_running}",
+                f"无损纳管 '{sess}' 成功: GPU={gpu_name or 'unknown'}{region_note}, 隧道已绑定本地代理 :{self.proxy.proxy_port}, keepalive={keepalive_running}",
             )
         else:
             if inferred_gpu:
@@ -1465,6 +1588,59 @@ class ColabManager:
             pass
         return {}
 
+    def _allocate_session_with_retry(
+        self,
+        *,
+        session: str,
+        gpu: str,
+        max_attempts: int = 5,
+    ) -> None:
+        """Allocate or reuse a Colab GPU session, retrying automatically on transient 502/503/504 or timeout errors."""
+        retry_delays = (15, 20, 25, 30)
+        cli_env = {"COLAB_CLI_ASSIGN_RETRIES": "1", "COLAB_CLI_RETRY_BACKOFF": "8"}
+
+        for attempt in range(1, max(1, int(max_attempts)) + 1):
+            err_msg = ""
+            if self.colab_python:
+                ens = self._run_bridge("ensure_session", session, gpu, timeout=110.0, extra_env=cli_env)
+                if ens and ens.get("ok"):
+                    return
+                err_msg = str((ens or {}).get("error") or "Colab 实例分配失败")
+            elif self.colab_bin:
+                cmd = [self.colab_bin, "new", "-s", session, "--gpu", gpu]
+                if gpu.lower() in HIGH_MEM_GPUS:
+                    cmd.append("--high-mem")
+                rc, out, err = self._run_bounded(cmd, timeout=110.0, extra_env=cli_env)
+                if rc == 0:
+                    return
+                err_msg = (err or out).strip()[-400:] or "colab new 失败"
+            else:
+                raise RuntimeError("未检测到 colab CLI 或 colab_cli 运行环境")
+
+            if attempt < max_attempts and _is_retryable_assign_error(err_msg):
+                wait_s = retry_delays[min(attempt - 1, len(retry_delays) - 1)]
+                short_err = err_msg.splitlines()[0][:140]
+                self._set_deployment(
+                    phase="provisioning",
+                    step_index=1,
+                    step_label=f"Colab {gpu} 调度繁忙，自动重试 ({attempt}/{max_attempts})",
+                    percent=round(2.0 + attempt * 0.6, 1),
+                    sub_percent=None,
+                    detail=f"后端容量紧张或响应超时，{wait_s}s 后自动进行第 {attempt + 1}/{max_attempts} 次分配...",
+                    eta_text=f"自动重试中 · {wait_s}s 后重试",
+                )
+                self.logs.emit(
+                    "deploy",
+                    "warn",
+                    f"[1/6] Colab {gpu} 分配暂时受限/超时 ({short_err})，{wait_s}s 后自动进行第 {attempt + 1}/{max_attempts} 次重试...",
+                )
+                time.sleep(wait_s)
+                continue
+
+            if attempt > 1:
+                raise RuntimeError(f"连续 {attempt} 次分配 Colab {gpu} 失败（当前资源池可能繁忙）: {err_msg}")
+            raise RuntimeError(err_msg)
+
     def _deploy_worker(self, gpu: str, session: str, engine_kind: str, mode_id: str) -> None:
         try:
             self.logs.emit("deploy", "info", f"[1/6] 开始部署 {engine_kind} ({mode_id}) 至 Colab '{session}' ({gpu})...")
@@ -1473,33 +1649,22 @@ class ColabManager:
             if gpu.lower() in SINGLE_SHAPE_GPUS:
                 self.logs.emit("deploy", "info", f"G4/单规格防呆已激活: {gpu} 不传 high_mem / Shape.HIGH_RAM")
 
-            # Step 1: Allocate / reuse session safely
-            if self.colab_python:
-                ens = self._run_bridge("ensure_session", session, gpu, timeout=90.0)
-                if not ens or not ens.get("ok"):
-                    raise RuntimeError((ens or {}).get("error") or "Colab 实例分配失败")
-            elif self.colab_bin:
-                cmd = [self.colab_bin, "new", "-s", session, "--gpu", gpu]
-                if gpu.lower() in HIGH_MEM_GPUS:
-                    cmd.append("--high-mem")
-                rc, out, err = self._run_bounded(cmd, timeout=90.0)
-                if rc != 0:
-                    raise RuntimeError((err or out).strip()[-300:] or "colab new 失败")
-            else:
-                raise RuntimeError("未检测到 colab CLI 或 colab_cli 运行环境")
+            # Step 1: Allocate / reuse session safely (with automatic backoff retry on transient capacity/timeouts)
+            self._allocate_session_with_retry(session=session, gpu=gpu, max_attempts=5)
 
-            # 开机第一时间探测机房地区，便于跨洲慢机房提前预警（不记录任何公网 IP）
+            # 开机第一时间探测机房地区，写入状态以便顶部/左侧常驻显示，并对跨洲慢机房提前预警（不记录任何公网 IP）
             loc = self._probe_vm_region(session)
-            country = str(loc.get("country") or "").strip().upper()
-            loc_label = ", ".join(p for p in (loc.get("city", ""), loc.get("region", ""), loc.get("country", "")) if p)
-            if country:
-                if country == "US":
-                    self.logs.emit("deploy", "info", f"[1/6] 已分配 Colab 实例机房: {loc_label}（美区近源，HF CDN 冷启高速）")
+            vm_region = _format_vm_region(loc)
+            if vm_region:
+                with self._lock:
+                    self._colab_state["vm_region"] = vm_region
+                if vm_region["is_us"]:
+                    self.logs.emit("deploy", "info", f"[1/6] 已分配 Colab 实例机房: {vm_region['short_label']} · {vm_region['full_label']}（美区近源，HF CDN 冷启高速）")
                 else:
                     self.logs.emit(
                         "deploy",
                         "warn",
-                        f"[1/6] 已分配 Colab 实例机房: {loc_label}（非美区跨洲节点，拉取美区 HF CDN 冷启可能需 35–55 分钟；加载完成后推理不受影响，如需快速冷启可立即释放重抽美区节点）",
+                        f"[1/6] 已分配 Colab 实例机房: {vm_region['short_label']} · {vm_region['full_label']}（非美区跨洲节点，拉取美区 HF CDN 冷启可能需 35–55 分钟；加载完成后推理不受影响，如需快速冷启可立即释放重抽美区节点）",
                     )
 
             # Step 2: Upload runtime packages & credentials from ~/.config/maya-gcs/
@@ -1958,6 +2123,7 @@ class ColabManager:
             with self._lock:
                 self._colab_state["gpu_name"] = ""
                 self._colab_state["mounts"] = {}
+                self._colab_state["vm_region"] = {}
             self._set_deployment(
                 phase="idle",
                 step_index=0,

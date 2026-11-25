@@ -1105,7 +1105,7 @@
       topEngineBadge.textContent = isStrata ? "Strata Engine (strata)" : `Project Maya (${engine.mode || ui.selectedMode})`;
     }
 
-    // GPU chip in topbar
+    // GPU chip & VM region badge in topbar
     const topGpuBadge = $("topGpuBadge");
     if (topGpuBadge) {
       if (colab.gpu_name) {
@@ -1113,6 +1113,26 @@
         topGpuBadge.classList.remove("hidden");
       } else {
         topGpuBadge.classList.add("hidden");
+      }
+    }
+
+    const vmReg = colab.vm_region && colab.vm_region.country ? colab.vm_region : null;
+    const topRegionBadge = $("topRegionBadge");
+    if (topRegionBadge) {
+      if (vmReg) {
+        topRegionBadge.textContent = ui.lang === "zh" ? (vmReg.short_label || vmReg.country) : (vmReg.short_label_en || vmReg.country);
+        topRegionBadge.className = `region-chip ${vmReg.is_us ? "region-chip--us" : "region-chip--intl"}`;
+        topRegionBadge.title = vmReg.is_us
+          ? (ui.lang === "zh"
+            ? `Colab 实例机房: ${vmReg.full_label || vmReg.country}（美区近源，HF CDN 冷启高速）`
+            : `Colab VM region: ${vmReg.full_label || vmReg.country} (US origin, fast HF CDN boot)`)
+          : (ui.lang === "zh"
+            ? `Colab 实例机房: ${vmReg.full_label || vmReg.country}（非美区跨洲节点，冷启拉取可能偏慢；上线后推理不受影响）`
+            : `Colab VM region: ${vmReg.full_label || vmReg.country} (non-US cross-region boot may be slower; inference unaffected once loaded)`);
+      } else {
+        topRegionBadge.className = "region-chip hidden";
+        topRegionBadge.textContent = "";
+        topRegionBadge.title = "";
       }
     }
 
@@ -1177,17 +1197,24 @@
       kaLbl.textContent = kaOn ? t("common.on") : t("common.off");
     }
 
-    // Runtime Strip (GPU + mounts)
+    // Runtime Strip (GPU + region + mounts)
     const runtimeStrip = $("colabRuntimeStrip");
     const gpuDetected = $("colabGpuDetected");
     const mountPills = $("colabMountPills");
     if (runtimeStrip && gpuDetected && mountPills) {
       const mountsObj = colab.mounts;
       const hasMountData = mountsObj && (Array.isArray(mountsObj) ? mountsObj.length > 0 : Object.keys(mountsObj).length > 0);
-      if (colab.gpu_name || hasMountData) {
+      if (colab.gpu_name || hasMountData || vmReg) {
         runtimeStrip.classList.remove("hidden");
         gpuDetected.textContent = colab.gpu_name ? `GPU: ${colab.gpu_name}` : "GPU: Attached";
         mountPills.innerHTML = "";
+        if (vmReg) {
+          const regPill = document.createElement("span");
+          regPill.className = `mount-pill ${vmReg.is_us ? "mount-pill--ok" : "mount-pill--warn"}`;
+          regPill.textContent = ui.lang === "zh" ? (vmReg.short_label || vmReg.country) : (vmReg.short_label_en || vmReg.country);
+          if (vmReg.full_label) regPill.title = vmReg.full_label;
+          mountPills.appendChild(regPill);
+        }
         if (Array.isArray(mountsObj)) {
           mountsObj.forEach((m) => {
             const sp = document.createElement("span");
