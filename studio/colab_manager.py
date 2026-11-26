@@ -1091,6 +1091,8 @@ class ColabManager:
             }
 
         clear_maya_upstream = False
+        stop_studio_keepalive = False
+        selected_session_snap = self.config.selected_session
         with self._lock:
             for k in ("logged_in", "email", "paid_balance", "burn_rate_hourly", "active_assignments", "sessions"):
                 if k in data:
@@ -1113,6 +1115,7 @@ class ColabManager:
                     self._colab_state["gpu_name"] = ""
                     self._colab_state["mounts"] = {}
                     self._colab_state["vm_region"] = {}
+                    stop_studio_keepalive = True
                     if self.config.engine_kind == "maya":
                         if str(self._deployment.get("phase") or "") in ("ready", "warming"):
                             self._set_deployment(
@@ -1127,6 +1130,11 @@ class ColabManager:
                             )
                         if self.config.upstream_url:
                             clear_maya_upstream = True
+
+        if stop_studio_keepalive:
+            _, stu_pids = self._find_keepalive_pids(selected_session_snap)
+            if stu_pids or (self._keepalive_thread is not None and self._keepalive_thread.is_alive()):
+                self.keepalive(enabled=False, session=selected_session_snap)
 
         if clear_maya_upstream:
             self.config.set_selection(upstream_url="")
@@ -1240,7 +1248,13 @@ class ColabManager:
         self.logs.emit("colab", "info", "已退出当前 Google Colab OAuth 会话")
         return res
 
-    def attach(self, session: str = "", engine_kind: str = "") -> dict[str, Any]:
+    def attach(
+        self,
+        session: str = "",
+        engine_kind: str = "",
+        *,
+        auto_keepalive: bool = True,
+    ) -> dict[str, Any]:
         """Non-destructive read-only attach to an existing Colab session via a single `colab exec`."""
         sess = (session or self.config.selected_session or "easycolab").strip()
         if not self.colab_bin:
@@ -1279,6 +1293,12 @@ class ColabManager:
         vm_region = _format_vm_region(probe.get("vm_region"))
         tunnel_url = str(probe.get("tunnel_url") or "").strip().rstrip("/")
         keepalive_running = self.is_keepalive_running(sess)
+        keepalive_auto_started = False
+        remote_engine_alive = (
+            bool(tunnel_url)
+            or bool(processes.get("maya_alive"))
+            or bool(processes.get("strata_alive"))
+        )
 
         inferred_gpu = None
         g_up = gpu_name.upper()
@@ -1303,6 +1323,20 @@ class ColabManager:
             self._colab_state["selected_session"] = sess
             if inferred_gpu:
                 self._colab_state["selected_gpu"] = inferred_gpu
+            deploy_busy = self._deploy_thread is not None and self._deploy_thread.is_alive()
+
+        if auto_keepalive and not deploy_busy and remote_engine_alive and not keepalive_running:
+            ka_res = self.keepalive(enabled=True, session=sess, interval_sec=720)
+            if ka_res.get("keepalive_running"):
+                keepalive_running = True
+                keepalive_auto_started = True
+                with self._lock:
+                    self._colab_state["keepalive_running"] = True
+                self.logs.emit(
+                    "keepalive",
+                    "success",
+                    f"无损纳管 '{sess}' 时检测到本机无保活进程，已自动恢复 12m 保活守护",
+                )
 
         self.refresh_auth_status(log_event=False)
 
@@ -1358,10 +1392,11 @@ class ColabManager:
                             eta_text="权重装载阶段预计 ~14–18 分钟",
                         )
             region_note = f", region={vm_region['short_label']}" if vm_region else ""
+            ka_note = "True (auto-restored)" if keepalive_auto_started else str(keepalive_running)
             self.logs.emit(
                 "colab",
                 "success",
-                f"无损纳管 '{sess}' 成功: GPU={gpu_name or 'unknown'}{region_note}, 隧道已绑定本地代理 :{self.proxy.proxy_port}, keepalive={keepalive_running}",
+                f"无损纳管 '{sess}' 成功: GPU={gpu_name or 'unknown'}{region_note}, 隧道已绑定本地代理 :{self.proxy.proxy_port}, keepalive={ka_note}",
             )
         else:
             if inferred_gpu:
@@ -1383,6 +1418,7 @@ class ColabManager:
             "tunnel_url": tunnel_url,
             "tunnel_masked": mask_url(tunnel_url) if tunnel_url else "",
             "keepalive_running": keepalive_running,
+            "keepalive_auto_started": keepalive_auto_started,
             "local_health": probe.get("local_health"),
             "colab": self.get_colab_snapshot(),
         }
@@ -1395,6 +1431,8 @@ class ColabManager:
 
         if enabled:
             if ext_pids:
+                with self._lock:
+                    self._colab_state["keepalive_running"] = True
                 self.logs.emit(
                     "keepalive",
                     "info",
@@ -1408,6 +1446,8 @@ class ColabManager:
                     "session": sess,
                 }
             if stu_pids:
+                with self._lock:
+                    self._colab_state["keepalive_running"] = True
                 return {
                     "ok": True,
                     "keepalive_running": True,
@@ -1430,6 +1470,8 @@ class ColabManager:
                     start_new_session=True,
                 )
                 log_fh.close()
+                with self._lock:
+                    self._colab_state["keepalive_running"] = True
                 self.logs.emit(
                     "keepalive",
                     "success",
@@ -1459,6 +1501,8 @@ class ColabManager:
 
             self._keepalive_thread = threading.Thread(target=_loop, name="studio-keepalive", daemon=True)
             self._keepalive_thread.start()
+            with self._lock:
+                self._colab_state["keepalive_running"] = True
             self.logs.emit("keepalive", "success", f"已启动内置 Python 保活线程 (session={sess}, interval={interval}s)")
             return {
                 "ok": True,
@@ -1487,6 +1531,8 @@ class ColabManager:
 
         ext_after, _ = self._find_keepalive_pids(sess)
         if ext_after:
+            with self._lock:
+                self._colab_state["keepalive_running"] = True
             self.logs.emit(
                 "keepalive",
                 "warn",
@@ -1500,6 +1546,8 @@ class ColabManager:
                 "stopped_studio": stopped_studio,
                 "message": "外部 keepalive_colab.sh 仍在运行（安全策略：仅停止由 Studio 启动的保活进程）",
             }
+        with self._lock:
+            self._colab_state["keepalive_running"] = False
         if stopped_studio:
             self.logs.emit("keepalive", "info", f"已停止 Studio 托管保活守护 (session={sess})")
         return {"ok": True, "keepalive_running": False, "external": False, "pids": [], "stopped_studio": stopped_studio}
@@ -1773,7 +1821,7 @@ class ColabManager:
             self.logs.emit("deploy", "info", "[5/6] 正在等待并提取隧道 URL...")
             tunnel_url = ""
             for _ in range(18):
-                att = self.attach(session=session, engine_kind=engine_kind)
+                att = self.attach(session=session, engine_kind=engine_kind, auto_keepalive=False)
                 tunnel_url = str(att.get("tunnel_url") or "")
                 if tunnel_url:
                     break

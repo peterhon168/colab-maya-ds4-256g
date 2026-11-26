@@ -1720,7 +1720,7 @@
     const doAttach = async (triggerBtn) => {
       setButtonBusy(triggerBtn, true, ui.lang === "zh" ? "只读探测纳管中..." : "Attaching...");
       try {
-        await apiRequest("/api/studio/colab/attach", {
+        const res = await apiRequest("/api/studio/colab/attach", {
           method: "POST",
           body: {
             session: getSessionValue(),
@@ -1730,7 +1730,11 @@
         });
         ui.dirtyInputs.delete("sessionInput");
         await refreshStateNow();
-        showToast(ui.lang === "zh" ? "已完成无损纳管并绑定本地代理" : "Attached losslessly");
+        if (res?.keepalive_auto_started) {
+          showToast(ui.lang === "zh" ? "已完成无损纳管，并自动恢复 12m 保活" : "Attached losslessly & restored 12m keepalive");
+        } else {
+          showToast(ui.lang === "zh" ? "已完成无损纳管并绑定本地代理" : "Attached losslessly");
+        }
       } catch (err) {
         showToast(`${ui.lang === "zh" ? "纳管失败" : "Attach failed"}: ${err.message}`, "err");
       } finally {

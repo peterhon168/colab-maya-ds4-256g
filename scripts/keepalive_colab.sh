@@ -39,7 +39,7 @@ def run_bounded(cmd, stdin_data=None, timeout=90):
         return 124, "TIMEOUT"
 
 run_bounded(["colab", "sessions"], timeout=30)
-script = """!pgrep -f "maya.py|maya-ds4" >/dev/null && echo "MAYA_ALIVE=1" || echo "MAYA_ALIVE=0"
+script = """!pgrep -f "maya.py|maya-ds4|strata" >/dev/null && echo "MAYA_ALIVE=1" || echo "MAYA_ALIVE=0"
 !grep -hoE "https://[a-zA-Z0-9-]+\\.trycloudflare\\.com" /content/project-maya/cloudflared.log /tmp/cloudflared.log 2>/dev/null | tail -n 1
 """
 rc, out = run_bounded(["colab", "exec", "-s", sess, "--timeout", "60"], stdin_data=script, timeout=90)

@@ -163,7 +163,7 @@ class StudioRuntime:
                     sessions = self.colab.get_colab_snapshot().get("sessions") or []
                     has_sess = any(isinstance(s, dict) and s.get("name") == sess for s in sessions)
                     if has_sess or self.colab.is_keepalive_running(sess):
-                        self.colab.attach(session=sess)
+                        self.colab.attach(session=sess, auto_keepalive=True)
                 self.refresh_telemetry_now()
             except Exception as exc:
                 self.logs.emit("system", "warn", f"初始化探测异常: {exc}")
@@ -742,6 +742,7 @@ class StudioServer:
                         res = rt.colab.attach(
                             session=str(body.get("session") or ""),
                             engine_kind=str(body.get("engine_kind") or ""),
+                            auto_keepalive=bool(body.get("auto_keepalive", True)),
                         )
                         if res.get("ok"):
                             res["state"] = rt.build_state_payload()
