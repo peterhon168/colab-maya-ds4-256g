@@ -1489,7 +1489,8 @@ body.shell-macos .topbar {
 }
 
 .step-sub-bar {
-  margin-top: 5px;
+  display: block;
+  margin-top: 6px;
   width: 100%;
   height: 4px;
   border-radius: 999px;
@@ -1498,10 +1499,22 @@ body.shell-macos .topbar {
 }
 
 .step-sub-fill {
+  display: block;
   height: 100%;
+  width: 0%;
   border-radius: 999px;
-  background: #60A5FA;
-  transition: width 0.3s ease;
+  background: linear-gradient(90deg, #3B82F6, #38BDF8);
+  transition: width 0.35s ease;
+}
+
+.step-item.is-active .step-sub-fill {
+  background: linear-gradient(90deg, #2563EB, #38BDF8, #60A5FA);
+  background-size: 200% 100%;
+  animation: progressShimmer 2.2s linear infinite;
+}
+
+.step-item.is-done .step-sub-fill {
+  background: var(--accent-emerald);
 }
 
 /* Right Column Live Progress Card */
@@ -1650,6 +1663,7 @@ body.shell-macos .topbar {
 }
 
 .step-label-wrap {
+  flex: 1;
   display: flex;
   flex-direction: column;
   min-width: 0;

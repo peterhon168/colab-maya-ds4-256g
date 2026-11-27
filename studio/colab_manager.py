@@ -658,13 +658,15 @@ def _parse_maya_warmup_lines(lines: list[str], ram_track: dict[str, float]) -> d
     wait_suffix = f" · 已等待 {last_start_sec}s" if last_start_sec is not None else ""
 
     # 严格按阶段优先级返回：RAM 拷贝 > VRAM 装载 > 初始化心跳，避免每 20s 一次的 still starting 心跳倒退覆盖真实专家进度
+    # sub_percent 统一映射为第 6 步整体完成度 (0..100%，由总进度 56%..100% 单调线性映射)，避免切到 RAM 阶段时进度条先满再倒退归零
     if last_ram is not None:
         x = int(last_ram.group(1))
         y = max(1, int(last_ram.group(2)))
         info = last_ram.group(3)
         frac = min(1.0, x / y)
         pct = round(74.0 + 25.0 * frac, 1)
-        sub_pct = round(100.0 * frac, 1)
+        ram_pct = round(100.0 * frac, 1)
+        step_sub = round(max(0.0, min(99.0, ((pct - 56.0) / 44.0) * 100.0)), 1)
         now = time.monotonic()
         if "x0" not in ram_track:
             ram_track["x0"] = float(x)
@@ -678,8 +680,8 @@ def _parse_maya_warmup_lines(lines: list[str], ram_track: dict[str, float]) -> d
             rem_s = max(10.0, (1.0 - frac) * 620.0 + 15.0)
         return {
             "percent": pct,
-            "sub_percent": sub_pct,
-            "label": f"正在装入 RAM 专家权重 ({sub_pct:.0f}%)",
+            "sub_percent": step_sub,
+            "label": f"正在装入 RAM 专家权重 ({ram_pct:.0f}%)",
             "detail": f"RAM 专家: {x:,} / {y:,} ({info}){wait_suffix}",
             "eta_text": f"预计剩余 ~{_fmt_duration(rem_s)}",
         }
@@ -690,21 +692,23 @@ def _parse_maya_warmup_lines(lines: list[str], ram_track: dict[str, float]) -> d
         info = last_vram.group(3)
         frac = min(1.0, x / y)
         pct = round(59.0 + 15.0 * frac, 1)
-        sub_pct = round(100.0 * frac, 1)
+        vram_pct = round(100.0 * frac, 1)
+        step_sub = round(max(0.0, min(99.0, ((pct - 56.0) / 44.0) * 100.0)), 1)
         rem_s = max(15.0, (1.0 - frac) * 260.0 + 580.0)
         return {
             "percent": pct,
-            "sub_percent": sub_pct,
-            "label": f"正在装入 VRAM 专家权重 ({sub_pct:.0f}%)",
+            "sub_percent": step_sub,
+            "label": f"正在装入 VRAM 专家权重 ({vram_pct:.0f}%)",
             "detail": f"VRAM 专家: {x:,} / {y:,} ({info}){wait_suffix}",
             "eta_text": f"VRAM 装入中 · 预计总剩余 ~{_fmt_duration(rem_s)}",
         }
 
     if last_start_sec is not None:
         pct = round(min(58.8, 56.0 + last_start_sec / 65.0), 1)
+        step_sub = round(max(2.0, min(10.0, ((pct - 56.0) / 44.0) * 100.0)), 1)
         return {
             "percent": pct,
-            "sub_percent": None,
+            "sub_percent": step_sub,
             "label": f"引擎正在初始化与校验分片 ({last_start_sec}s)...",
             "detail": "校验 GGUF 索引并分配 96GB 显存空间",
             "eta_text": "权重装载阶段预计 ~14–18 分钟",
@@ -1388,6 +1392,7 @@ class ColabManager:
                             step_index=6,
                             step_label="隧道已连通 · 正在等待权重装载...",
                             percent=56.0,
+                            sub_percent=2.0,
                             detail="远端引擎已启动，等待开放 :8000",
                             eta_text="权重装载阶段预计 ~14–18 分钟",
                         )
@@ -1583,7 +1588,7 @@ class ColabManager:
             step_index=1,
             step_label="分配与校验 Colab GPU 实例",
             percent=2.0,
-            sub_percent=None,
+            sub_percent=12.0,
             detail=f"请求 {gpu_clean} 实例规格",
             eta_text="本步预计 ~10–30 秒 · 首次冷启全程约 22–28 分钟",
             reset_timer=True,
@@ -1673,7 +1678,7 @@ class ColabManager:
                     step_index=1,
                     step_label=f"Colab {gpu} 调度繁忙，自动重试 ({attempt}/{max_attempts})",
                     percent=round(2.0 + attempt * 0.6, 1),
-                    sub_percent=None,
+                    sub_percent=round(min(70.0, 15.0 + attempt * 11.0), 1),
                     detail=f"后端容量紧张或响应超时，{wait_s}s 后自动进行第 {attempt + 1}/{max_attempts} 次分配...",
                     eta_text=f"自动重试中 · {wait_s}s 后重试",
                 )
@@ -1701,6 +1706,15 @@ class ColabManager:
             self._allocate_session_with_retry(session=session, gpu=gpu, max_attempts=5)
 
             # 开机第一时间探测机房地区，写入状态以便顶部/左侧常驻显示，并对跨洲慢机房提前预警（不记录任何公网 IP）
+            self._set_deployment(
+                phase="provisioning",
+                step_index=1,
+                step_label="GPU 实例已就绪，正在探测机房地区...",
+                percent=5.0,
+                sub_percent=78.0,
+                detail=f"已分配 {gpu} 实例，校验网络机房与可用区",
+                eta_text="即将开始上传运行包 (~2s)",
+            )
             loc = self._probe_vm_region(session)
             vm_region = _format_vm_region(loc)
             if vm_region:
@@ -1721,7 +1735,7 @@ class ColabManager:
                 step_index=2,
                 step_label="上传预编译运行包与安全凭据",
                 percent=6.0,
-                sub_percent=0.0,
+                sub_percent=5.0,
                 detail="准备上传运行包与加速源码...",
                 eta_text="本步预计 ~15–30 秒",
             )
@@ -1744,38 +1758,39 @@ class ColabManager:
                 if cp.is_file():
                     uploads.append((cp, f"/tmp/{cname}"))
 
-            total_uploads = len(uploads)
-            for idx, (local_p, remote_p) in enumerate(uploads, start=1):
+            for local_p, _ in uploads:
                 if not local_p.is_file():
                     raise RuntimeError(f"缺少部署资源文件: {local_p.name}")
-                self._set_deployment(
-                    phase="uploading",
-                    step_index=2,
-                    step_label="上传预编译运行包与安全凭据",
-                    percent=round(6.0 + 6.0 * (idx / max(1, total_uploads)), 1),
-                    sub_percent=round(100.0 * idx / max(1, total_uploads), 1),
-                    detail=f"上传组件 ({idx}/{total_uploads}): {local_p.name}",
-                    eta_text="本步预计 ~15–30 秒",
-                )
-                self._upload_file(session, local_p, remote_p)
 
-            # Upload credentials from ~/.config/maya-gcs/ (respecting pure-hf / shm mode isolation)
             hf_tok = CONFIG_DIR / "hf-token"
             if hf_tok.is_file():
-                self._upload_file(session, hf_tok, "/tmp/hf-token")
+                uploads.append((hf_tok, "/tmp/hf-token"))
 
             if mode_id not in ("b1_pure_hf", "b2_shm"):
                 gcs_key = CONFIG_DIR / "gcs-key.json"
                 gcs_bucket = CONFIG_DIR / "bucket"
                 if gcs_key.is_file():
-                    self._upload_file(session, gcs_key, "/tmp/gcs-key.json")
+                    uploads.append((gcs_key, "/tmp/gcs-key.json"))
                 if gcs_bucket.is_file():
-                    self._upload_file(session, gcs_bucket, "/tmp/gcs-bucket")
+                    uploads.append((gcs_bucket, "/tmp/gcs-bucket"))
 
             maya_api_key = CONFIG_DIR / "maya-api-key"
             has_maya_api_key = maya_api_key.is_file() and bool(self.config.read_credential_file("maya_api_key"))
             if has_maya_api_key:
-                self._upload_file(session, maya_api_key, "/tmp/maya-api-key")
+                uploads.append((maya_api_key, "/tmp/maya-api-key"))
+
+            total_uploads = len(uploads)
+            for idx, (local_p, remote_p) in enumerate(uploads, start=1):
+                self._set_deployment(
+                    phase="uploading",
+                    step_index=2,
+                    step_label="上传预编译运行包与安全凭据",
+                    percent=round(6.0 + 7.5 * (idx / max(1, total_uploads)), 1),
+                    sub_percent=round(100.0 * idx / max(1, total_uploads), 1),
+                    detail=f"上传组件 ({idx}/{total_uploads}): {local_p.name}",
+                    eta_text="本步预计 ~15–30 秒",
+                )
+                self._upload_file(session, local_p, remote_p)
 
             # Step 3 & 4: Detached remote execution with live log & shard-download telemetry streaming
             self._set_deployment(
@@ -1783,7 +1798,7 @@ class ColabManager:
                 step_index=3,
                 step_label="准备运行环境与挂载 /mnt/hf FUSE3",
                 percent=14.0,
-                sub_percent=None,
+                sub_percent=4.0,
                 detail="启动远端部署守护并初始化环境...",
                 eta_text="环境挂载预计 ~1–2 分钟 · 全程约 22–28 分钟",
             )
@@ -1806,6 +1821,15 @@ class ColabManager:
             )
 
             if engine_kind == "strata":
+                self._set_deployment(
+                    phase="starting",
+                    step_index=4,
+                    step_label="拉起 Strata 推理服务...",
+                    percent=53.0,
+                    sub_percent=90.0,
+                    detail="后台启动 serve/server.py --engine strata",
+                    eta_text="本步预计 ~5–10 秒",
+                )
                 self._launch_strata_on_colab(session, cfg_settings)
 
             # Step 5: Tunnel extraction & keepalive
@@ -1814,17 +1838,35 @@ class ColabManager:
                 step_index=5,
                 step_label="建立 Cloudflare 隧道与启动保活",
                 percent=54.0,
-                sub_percent=None,
+                sub_percent=15.0,
                 detail="提取 *.trycloudflare.com 并启动 12m 保活",
                 eta_text="预计 ~5–10 秒",
             )
             self.logs.emit("deploy", "info", "[5/6] 正在等待并提取隧道 URL...")
             tunnel_url = ""
-            for _ in range(18):
+            for t_idx in range(1, 19):
                 att = self.attach(session=session, engine_kind=engine_kind, auto_keepalive=False)
                 tunnel_url = str(att.get("tunnel_url") or "")
                 if tunnel_url:
+                    self._set_deployment(
+                        phase="tunneling",
+                        step_index=5,
+                        step_label="Cloudflare 隧道已就绪",
+                        percent=55.8,
+                        sub_percent=100.0,
+                        detail="已提取 *.trycloudflare.com 隧道地址，准备装入权重",
+                        eta_text="正在进入权重装载阶段",
+                    )
                     break
+                self._set_deployment(
+                    phase="tunneling",
+                    step_index=5,
+                    step_label=f"等待 Cloudflare 隧道注册 ({t_idx}/18)...",
+                    percent=round(min(55.5, 54.0 + t_idx * 0.1), 1),
+                    sub_percent=round(min(92.0, 15.0 + t_idx * 8.0), 1),
+                    detail="轮询 cloudflared.log 提取公网 HTTPS 隧道",
+                    eta_text="预计 ~5–10 秒",
+                )
                 time.sleep(3.0)
 
             if not tunnel_url:
@@ -1836,7 +1878,7 @@ class ColabManager:
                 step_index=6,
                 step_label="隧道已连通，正在将权重装入显存与内存...",
                 percent=56.0,
-                sub_percent=0.0,
+                sub_percent=2.0,
                 detail="正在初始化 GGUF 索引并流式装载 748B 专家...",
                 eta_text="权重装载阶段预计 ~14–18 分钟",
             )
@@ -1933,6 +1975,8 @@ class ColabManager:
         last_dl_log_t = 0.0
         in_download_stage = False
         in_compile_stage = False
+        pre_stage = 0  # 0: init, 1: [2/6], 2: [3/6], 3: extra_assets (dspark/vision)
+        compile_stage = 0  # 1: [5/6], 2: [6/6], 3: refresher/libcurl, 4: gcc/gcs_tls_pread, 5: cloudflared/maya
         deadline = time.monotonic() + 1800.0
         poll_fail_streak = 0
 
@@ -2004,11 +2048,33 @@ class ColabManager:
                 if not ln:
                     continue
                 self.logs.emit("deploy", "info", ln)
+                if "[2/6]" in ln:
+                    pre_stage = max(pre_stage, 1)
+                if "[3/6]" in ln:
+                    pre_stage = max(pre_stage, 2)
                 if "[4/6]" in ln:
                     in_download_stage = True
-                if "[5/6]" in ln or "[6/6]" in ln or "gcs_tls_pread" in ln:
+                if "dspark.bin" in ln or "vision.bin" in ln:
+                    pre_stage = max(pre_stage, 3)
+                if "[5/6]" in ln:
                     in_compile_stage = True
                     in_download_stage = False
+                    compile_stage = max(compile_stage, 1)
+                if "[6/6]" in ln:
+                    in_compile_stage = True
+                    in_download_stage = False
+                    compile_stage = max(compile_stage, 2)
+                if "libcurl4-openssl-dev" in ln or "maya_url_token_refresher" in ln:
+                    in_compile_stage = True
+                    in_download_stage = False
+                    compile_stage = max(compile_stage, 3)
+                if "gcs_tls_pread" in ln:
+                    in_compile_stage = True
+                    in_download_stage = False
+                    compile_stage = max(compile_stage, 4)
+                if "trycloudflare.com" in ln or "maya.py" in ln:
+                    if in_compile_stage:
+                        compile_stage = max(compile_stage, 5)
 
             now = time.monotonic()
             dt = max(0.1, now - prev_t)
@@ -2019,19 +2085,31 @@ class ColabManager:
             prev_t = now
 
             if in_compile_stage:
+                compile_map = {
+                    1: (49.0, 20.0, "恢复预打包索引与自适应配置"),
+                    2: (50.2, 42.0, "准备启动推理服务进程"),
+                    3: (51.2, 64.0, "配置 HTTP/2 直连与令牌刷新守护"),
+                    4: (52.4, 82.0, "编译 gcs_tls_pread.so 加速库并拉起引擎"),
+                    5: (53.5, 96.0, "引擎进程与隧道后台已拉起"),
+                }
+                c_pct, c_sub, c_lbl = compile_map.get(
+                    compile_stage,
+                    (51.0, 60.0, "编译 gcs_tls_pread.so 加速库并拉起引擎"),
+                )
                 self._set_deployment(
                     phase="starting",
                     step_index=4,
-                    step_label="编译 gcs_tls_pread.so 加速库并拉起引擎",
-                    percent=51.0,
-                    sub_percent=None,
+                    step_label=c_lbl,
+                    percent=c_pct,
+                    sub_percent=c_sub,
                     detail="gcc -O2 编译双模态预读库并后台启动 maya.py",
                     eta_text="本步预计 ~15–30 秒",
                 )
             elif in_download_stage or shard_bytes > 50_000_000:
                 frac = min(1.0, shard_bytes / max(1, target_bytes))
                 pct = round(18.0 + 30.0 * frac, 1)
-                sub_pct = round(100.0 * frac, 1)
+                raw_dl_pct = round(100.0 * frac, 1)
+                sub_pct = round(min(99.0, max(20.0 + 76.0 * frac, 98.0 if pre_stage >= 3 else 0.0)), 1)
                 cur_gib = shard_bytes / (1024 ** 3)
                 tot_gib = target_bytes / (1024 ** 3)
                 speed_str = f" · {ema_bps / 1048576:.0f} MiB/s" if ema_bps > 1_048_576 else ""
@@ -2045,7 +2123,7 @@ class ColabManager:
                 self._set_deployment(
                     phase="mounting",
                     step_index=3,
-                    step_label=f"高速拉取 NVMe 模型分片 ({sub_pct:.1f}%)",
+                    step_label=f"高速拉取 NVMe 模型分片 ({raw_dl_pct:.1f}%)",
                     percent=pct,
                     sub_percent=sub_pct,
                     detail=f"已拉取 {cur_gib:.1f} / {tot_gib:.1f} GiB{speed_str}",
@@ -2056,8 +2134,23 @@ class ColabManager:
                     self.logs.emit(
                         "deploy",
                         "info",
-                        f"[3/6] NVMe 分片进度: {sub_pct:.1f}% ({cur_gib:.1f} / {tot_gib:.1f} GiB{speed_str})",
+                        f"[3/6] NVMe 分片进度: {raw_dl_pct:.1f}% ({cur_gib:.1f} / {tot_gib:.1f} GiB{speed_str})",
                     )
+            elif pre_stage >= 1:
+                pre_map = {
+                    1: (15.0, 10.0, "恢复 maya-ds4 运行环境与校验 GPU"),
+                    2: (16.5, 16.0, "检查并准备 Python .venv 依赖环境"),
+                }
+                p_pct, p_sub, p_lbl = pre_map.get(pre_stage, (14.5, 8.0, "初始化远端运行环境..."))
+                self._set_deployment(
+                    phase="mounting",
+                    step_index=3,
+                    step_label=p_lbl,
+                    percent=p_pct,
+                    sub_percent=p_sub,
+                    detail="正在准备远端挂载与模型拉取环境...",
+                    eta_text="分片拉取预计 ~8–11 分钟 · 随后装入显存 ~15 分钟",
+                )
 
             if boot_rc is not None:
                 if int(boot_rc) != 0:

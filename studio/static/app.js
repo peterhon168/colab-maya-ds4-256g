@@ -673,6 +673,31 @@
     return Math.round((stepIndex / 6) * 100);
   }
 
+  const STEP_PERCENT_RANGES = {
+    1: [0, 6],
+    2: [6, 14],
+    3: [14, 48],
+    4: [48, 54],
+    5: [54, 56],
+    6: [56, 100],
+  };
+
+  function resolveStepSubPercent(stepNum, done, active, deployment, totalPct) {
+    if (done) return 100;
+    if (!active) return 0;
+    const rawSub = deployment?.sub_percent;
+    if (typeof rawSub === "number" && Number.isFinite(rawSub)) {
+      return Math.max(0, Math.min(100, rawSub));
+    }
+    const range = STEP_PERCENT_RANGES[stepNum];
+    if (range && typeof totalPct === "number" && Number.isFinite(totalPct)) {
+      const [lo, hi] = range;
+      const span = Math.max(1, hi - lo);
+      return Math.max(4, Math.min(99, ((totalPct - lo) / span) * 100));
+    }
+    return 10;
+  }
+
   function buildEtaSummary(deployment, engineOnline) {
     const elapsed = getLiveElapsedSec(deployment, engineOnline);
     const elapsedPart = elapsed > 0 ? `${ui.lang === "zh" ? "已用" : "Elapsed"} ${formatElapsed(elapsed)}` : "";
@@ -761,7 +786,7 @@
     DEPLOY_STEPS.forEach((item) => {
       const done = !staleIdleOrReady && (engineOnline || (stepIndex > item.step) || (item.step < 6 && stepIndex === 6 && !deployment?.error));
       const active = !staleIdleOrReady && !done && !deployment?.error && (stepIndex === item.step);
-      const subPct = active && typeof deployment?.sub_percent === "number" ? Math.max(0, Math.min(100, deployment.sub_percent)) : null;
+      const subPct = staleIdleOrReady ? 0 : resolveStepSubPercent(item.step, done, active, deployment, pct);
       const el = document.createElement("div");
       el.className = `step-item${done ? " is-done" : ""}${active ? " is-active" : ""}`;
       el.innerHTML = `
@@ -769,7 +794,7 @@
         <span class="step-label-wrap">
           <span class="step-name">${escapeHtml(ui.lang === "zh" ? item.zh : item.en)}</span>
           <span class="step-sub">${escapeHtml(ui.lang === "zh" ? item.sub_zh : item.sub_en)}</span>
-          ${subPct !== null ? `<span class="step-sub-bar"><span class="step-sub-fill" style="width:${subPct.toFixed(1)}%"></span></span>` : ""}
+          <span class="step-sub-bar" aria-hidden="true"><span class="step-sub-fill" style="width:${subPct.toFixed(1)}%"></span></span>
         </span>
       `;
       grid.appendChild(el);
