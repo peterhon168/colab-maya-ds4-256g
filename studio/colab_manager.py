@@ -1096,6 +1096,7 @@ class ColabManager:
 
         clear_maya_upstream = False
         stop_studio_keepalive = False
+        had_live_state = False
         selected_session_snap = self.config.selected_session
         with self._lock:
             for k in ("logged_in", "email", "paid_balance", "burn_rate_hourly", "active_assignments", "sessions"):
@@ -1116,6 +1117,11 @@ class ColabManager:
             if bool(data.get("ok")) and bool(data.get("logged_in")) and int(data.get("active_assignments") or 0) == 0:
                 deploy_busy = self._deploy_thread is not None and self._deploy_thread.is_alive()
                 if not deploy_busy:
+                    had_live_state = bool(
+                        self._colab_state.get("gpu_name")
+                        or self._colab_state.get("vm_region")
+                        or self.config.upstream_url
+                    )
                     self._colab_state["gpu_name"] = ""
                     self._colab_state["mounts"] = {}
                     self._colab_state["vm_region"] = {}
@@ -1139,6 +1145,13 @@ class ColabManager:
             _, stu_pids = self._find_keepalive_pids(selected_session_snap)
             if stu_pids or (self._keepalive_thread is not None and self._keepalive_thread.is_alive()):
                 self.keepalive(enabled=False, session=selected_session_snap)
+
+        if had_live_state:
+            self.logs.emit(
+                "colab",
+                "warn",
+                f"检测到 Colab 会话 '{selected_session_snap}' 已消失（平台抢占/超时回收或容器退出），已自动复位本地代理与保活状态",
+            )
 
         if clear_maya_upstream:
             self.config.set_selection(upstream_url="")
@@ -1495,14 +1508,32 @@ class ColabManager:
             self._keepalive_session = sess
 
             def _loop() -> None:
-                while not self._keepalive_stop_ev.wait(interval):
-                    if self.colab_bin:
-                        self._run_bounded(
-                            [self.colab_bin, "exec", "-s", sess, "--timeout", "30"],
-                            stdin_data="_studio_hb = 1\n",
-                            timeout=40.0,
-                        )
+                wait_sec = interval
+                while not self._keepalive_stop_ev.wait(wait_sec):
+                    if not self.colab_bin:
+                        wait_sec = interval
+                        continue
+                    rc, out, err = self._run_bounded(
+                        [self.colab_bin, "exec", "-s", sess, "--timeout", "30"],
+                        stdin_data="print('__STUDIO_HB_OK__')\n",
+                        timeout=40.0,
+                    )
+                    combined = f"{out}\n{err}"
+                    if "not found" in combined or "No active sessions" in combined:
+                        with self._lock:
+                            self._colab_state["keepalive_running"] = False
+                        self.logs.emit("keepalive", "info", f"Session '{sess}' 已结束或释放，停止内置保活线程")
+                        break
+                    if rc == 0 and "__STUDIO_HB_OK__" in out and "UNEXPECTED_EOF" not in combined:
                         self.logs.emit("keepalive", "info", f"Studio 内置心跳已发送至 '{sess}'")
+                        wait_sec = interval
+                    else:
+                        self.logs.emit(
+                            "keepalive",
+                            "warn",
+                            f"Studio 内置心跳未收到回执 (rc={rc})，60s 后快速重试...",
+                        )
+                        wait_sec = 60
 
             self._keepalive_thread = threading.Thread(target=_loop, name="studio-keepalive", daemon=True)
             self._keepalive_thread.start()

@@ -13,6 +13,7 @@ MAYA_API_KEY_FILE="${MAYA_API_KEY_FILE:-$HOME/.config/maya-gcs/maya-api-key}"
 echo "[keepalive] 已启动 Colab Session ($SESSION) 内核防休眠保活守护 (间隔: ${INTERVAL_SEC}s)..."
 
 SYNCED_URL=""
+FAIL_STREAK=0
 
 while true; do
   OUT="$(python3 - "$SESSION" << 'PY' 2>&1
@@ -44,22 +45,35 @@ script = """!pgrep -f "maya.py|maya-ds4|strata" >/dev/null && echo "MAYA_ALIVE=1
 """
 rc, out = run_bounded(["colab", "exec", "-s", sess, "--timeout", "60"], stdin_data=script, timeout=90)
 print(out, end="")
+print(f"\n__KA_EXEC_RC__={rc}")
 PY
 )"
-  if echo "$OUT" | grep -q "TIMEOUT"; then
-    echo "[keepalive] $(date '+%Y-%m-%d %H:%M:%S') 心跳超时 (90s)，将在下个周期重试。"
-    sleep 60
-    continue
-  fi
+  EXEC_RC="$(echo "$OUT" | awk -F= '/^__KA_EXEC_RC__=/{v=$2} END{print v+0}')"
+
   if echo "$OUT" | grep -q "not found\|No active sessions"; then
-    echo "[keepalive] Session '$SESSION' 已结束或释放，退出保活守护。"
+    echo "[keepalive] $(date '+%Y-%m-%d %H:%M:%S') Session '$SESSION' 已结束或释放，退出保活守护。"
     exit 0
   fi
 
   if echo "$OUT" | grep -q "MAYA_ALIVE=0"; then
-    echo "[keepalive] 远端 maya.py / maya-ds4 未运行，退出保活守护。"
+    echo "[keepalive] $(date '+%Y-%m-%d %H:%M:%S') 远端 maya.py / maya-ds4 / strata 未运行，退出保活守护。"
     exit 0
   fi
+
+  # 仅当 colab exec 退出码为 0 且远端实际回传了 MAYA_ALIVE=1（且未出现 SSL/Websocket 断连）时，才认定本次心跳真正到达 Kernel
+  if [ "$EXEC_RC" -ne 0 ] || ! echo "$OUT" | grep -q "MAYA_ALIVE=1" || echo "$OUT" | grep -q "TIMEOUT\|UNEXPECTED_EOF\|Websocket connection is closed"; then
+    FAIL_STREAK=$((FAIL_STREAK + 1))
+    RETRY_WAIT=60
+    if [ "$FAIL_STREAK" -gt 3 ]; then
+      RETRY_WAIT=120
+    fi
+    ERR_HINT="$(echo "$OUT" | grep -v "^__KA_EXEC_RC__=" | grep -E "TIMEOUT|ERROR|Exception|UNEXPECTED_EOF|Traceback|Websocket connection is closed" | tail -n 1 | tr -d '\r' | cut -c1-180)"
+    echo "[keepalive] $(date '+%Y-%m-%d %H:%M:%S') 心跳异常或未收到 Kernel 回执 (streak=${FAIL_STREAK}, rc=${EXEC_RC}, hint=${ERR_HINT:-no_receipt})，${RETRY_WAIT}s 后快速重试..."
+    sleep "$RETRY_WAIT"
+    continue
+  fi
+
+  FAIL_STREAK=0
 
   TUNNEL_URL="$(echo "$OUT" | grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" | tail -n 1 || true)"
   if [ -n "$TUNNEL_URL" ] && [ "$TUNNEL_URL" != "$SYNCED_URL" ]; then
