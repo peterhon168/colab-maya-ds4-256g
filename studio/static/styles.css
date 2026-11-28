@@ -1015,7 +1015,34 @@ body.shell-macos .topbar {
 }
 
 .card-footer-danger {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   padding-top: 2px;
+}
+
+.btn--handoff {
+  border-color: rgba(245, 158, 11, 0.45);
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.14), rgba(59, 130, 246, 0.14));
+  color: #FDE68A;
+}
+
+.btn--handoff:hover:not(:disabled) {
+  border-color: rgba(245, 158, 11, 0.75);
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.24), rgba(59, 130, 246, 0.22));
+  color: #FEF3C7;
+}
+
+.diag-chip--handoff {
+  border-color: rgba(245, 158, 11, 0.42);
+  color: #FDE68A;
+  background: rgba(245, 158, 11, 0.1);
+}
+
+.diag-chip--handoff:hover:not(:disabled) {
+  border-color: rgba(245, 158, 11, 0.75);
+  background: rgba(245, 158, 11, 0.2);
+  color: #FEF3C7;
 }
 
 /* Segmented Control */

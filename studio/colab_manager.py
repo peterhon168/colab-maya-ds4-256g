@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import plistlib
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -871,6 +873,7 @@ class ColabManager:
             "error": "",
         }
         self._deploy_thread: threading.Thread | None = None
+        self._handoff_thread: threading.Thread | None = None
         self._keepalive_proc: subprocess.Popen[str] | None = None
         self._keepalive_thread: threading.Thread | None = None
         self._keepalive_stop_ev = threading.Event()
@@ -2323,6 +2326,21 @@ class ColabManager:
         preset_key = (preset or "custom").strip().lower()
         t0 = time.perf_counter()
 
+        if preset_key == "handoff_easycolab" or (
+            preset_key == "custom" and (command or "").strip().lower() in ("/handoff-easycolab", "handoff-easycolab")
+        ):
+            res = self.handoff_to_easycolab(session=sess, confirm=True, clean_models=True, launch_easycolab=True)
+            msg = res.get("message") or res.get("error") or ""
+            return {
+                "ok": bool(res.get("ok")),
+                "preset": "handoff_easycolab",
+                "exit_code": 0 if res.get("ok") else 400,
+                "stdout": msg,
+                "stderr": "" if res.get("ok") else msg,
+                "output": msg,
+                "duration_ms": round((time.perf_counter() - t0) * 1000.0, 1),
+            }
+
         if preset_key == "colab_usage":
             snap = self.refresh_auth_status(log_event=False)
             out_lines = [
@@ -2423,6 +2441,319 @@ class ColabManager:
             "output": combined,
             "duration_ms": dur,
         }
+
+    @staticmethod
+    def discover_easycolab_bundle() -> dict[str, str]:
+        """Locate local EasyColab.app resources and venv Python via standard paths (no private hardcoding)."""
+        candidates: list[Path] = []
+        env_dir = os.environ.get("EASYCOLAB_APP_DIR", "").strip()
+        if env_dir:
+            candidates.append(Path(env_dir).expanduser())
+        candidates.extend(
+            [
+                Path("/Applications/EasyColab.app"),
+                Path.home() / "Applications" / "EasyColab.app",
+            ]
+        )
+        app_path: Path | None = None
+        res_dir: Path | None = None
+        for cand in candidates:
+            if (cand / "Contents" / "Resources" / "app.py").is_file():
+                app_path = cand
+                res_dir = cand / "Contents" / "Resources"
+                break
+            if (cand / "app.py").is_file():
+                res_dir = cand
+                if (cand / "EasyColab.app").is_dir():
+                    app_path = cand / "EasyColab.app"
+                break
+
+        venv_py = Path.home() / "Library" / "Application Support" / "EasyColab" / "venv" / "bin" / "python"
+        return {
+            "installed": "1" if (app_path or res_dir) else "",
+            "app_path": str(app_path) if app_path else "",
+            "res_dir": str(res_dir) if res_dir else "",
+            "app_py": str(res_dir / "app.py") if res_dir and (res_dir / "app.py").is_file() else "",
+            "runtime_auth_py": str(res_dir / "runtime_auth.py") if res_dir and (res_dir / "runtime_auth.py").is_file() else "",
+            "venv_python": str(venv_py) if venv_py.is_file() else "",
+        }
+
+    def handoff_to_easycolab(
+        self,
+        *,
+        session: str = "",
+        confirm: bool = False,
+        clean_models: bool = True,
+        launch_easycolab: bool = True,
+    ) -> dict[str, Any]:
+        """Non-destructively clear Maya LLM runtime/cache while keeping Colab VM alive and hand off to EasyColab."""
+        if confirm is not True:
+            return {"ok": False, "error": "必须传入 confirm: true 才可执行热切 EasyColab 清场"}
+        if not self.colab_bin:
+            return {"ok": False, "error": "未找到 colab CLI 可执行文件"}
+
+        sess = (session or self.config.selected_session or "easycolab").strip()
+        with self._lock:
+            if self._deploy_thread is not None and self._deploy_thread.is_alive():
+                return {"ok": False, "error": "当前有部署任务正在运行，请等待或停止后再热切"}
+            if self._handoff_thread is not None and self._handoff_thread.is_alive():
+                return {"ok": False, "error": "热切 EasyColab 任务已在执行中，请查看右侧日志"}
+
+            gpu_label = str(self._colab_state.get("selected_gpu") or self.config.selected_gpu or "G4").upper()
+            self._handoff_thread = threading.Thread(
+                target=self._handoff_worker,
+                args=(sess, gpu_label, bool(clean_models), bool(launch_easycolab)),
+                name="studio-easycolab-handoff",
+                daemon=True,
+            )
+            self._handoff_thread.start()
+
+        return {
+            "ok": True,
+            "started": True,
+            "session": sess,
+            "message": f"已启动保留 Colab VM '{sess}' 的热切任务，正在清场腾出显存与磁盘...",
+        }
+
+    def _handoff_worker(self, sess: str, gpu_label: str, clean_models: bool, launch_easycolab: bool) -> None:
+        try:
+            self.logs.emit(
+                "colab",
+                "info",
+                f"[热切 EasyColab] 开始清理 '{sess}' 上的 Maya LLM 占用（绝不释放 Colab {gpu_label} 实例）...",
+            )
+            self.keepalive(enabled=False, session=sess)
+
+            rm_block = (
+                "    for p in ('/content/maya-models', '/content/project-maya', '/dev/shm/mmproj'):\n"
+                "        shutil.rmtree(p, ignore_errors=True)\n"
+                "    import glob\n"
+                "    for pat in ('/tmp/maya-*', '/tmp/hf-*', '/tmp/hf_ro_fuse*', '/tmp/gcs*', '/tmp/start_g4_256g.sh', '/tmp/studio_boot*', '/dev/shm/maya*', '/dev/shm/.maya*'):\n"
+                "        for m in glob.glob(pat):\n"
+                "            if os.path.isdir(m):\n"
+                "                shutil.rmtree(m, ignore_errors=True)\n"
+                "            else:\n"
+                "                try:\n"
+                "                    os.remove(m)\n"
+                "                except OSError:\n"
+                "                    pass\n"
+                if clean_models
+                else "    pass\n"
+            )
+            cleanup_py = (
+                "import json, os, shutil, subprocess, time\n"
+                "for pat in ('/content/project-maya/maya.py', '/content/project-maya/serve/server.py', '/content/project-maya/build/maya-ds4', 'maya_url_token_refresher', 'cloudflared'):\n"
+                "    subprocess.run(['pkill', '-9', '-f', pat], check=False)\n"
+                "time.sleep(1.0)\n"
+                "for mp in ('/mnt/hf', '/mnt/gcs'):\n"
+                "    subprocess.run(['fusermount3', '-u', mp], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+                "    subprocess.run(['umount', '-l', mp], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+                "subprocess.run(['pkill', '-9', '-f', 'hf_ro_fuse|gcsfuse'], check=False)\n"
+                "if True:\n"
+                f"{rm_block}"
+                "gpu_name = ''\n"
+                "vram_used = 0\n"
+                "vram_total = 0\n"
+                "try:\n"
+                "    out = subprocess.check_output(['nvidia-smi', '--query-gpu=name,memory.used,memory.total', '--format=csv,noheader,nounits'], text=True).strip().splitlines()[0]\n"
+                "    parts = [x.strip() for x in out.split(',')]\n"
+                "    gpu_name = parts[0]\n"
+                "    vram_used = int(float(parts[1]))\n"
+                "    vram_total = int(float(parts[2]))\n"
+                "except Exception:\n"
+                "    pass\n"
+                "du = shutil.disk_usage('/content' if os.path.isdir('/content') else '/')\n"
+                "disk_avail_gb = round(du.free / (1024 ** 3), 1)\n"
+                "ram_avail_gb = 0.0\n"
+                "try:\n"
+                "    for ln in open('/proc/meminfo'):\n"
+                "        if ln.startswith('MemAvailable:'):\n"
+                "            ram_avail_gb = round(int(ln.split()[1]) / (1024 ** 2), 1)\n"
+                "            break\n"
+                "except Exception:\n"
+                "    pass\n"
+                "print('STUDIO_CLEANUP_JSON:' + json.dumps({'gpu_name': gpu_name, 'vram_used_mb': vram_used, 'vram_total_mb': vram_total, 'ram_avail_gb': ram_avail_gb, 'disk_avail_gb': disk_avail_gb}, ensure_ascii=False))\n"
+            )
+            rc, out, err = self._run_bounded(
+                [self.colab_bin, "exec", "-s", sess, "--timeout", "45"],
+                stdin_data=cleanup_py,
+                timeout=60.0,
+            )
+            stats = _extract_marked_json(out, "STUDIO_CLEANUP_JSON:")
+            if rc != 0 or stats is None:
+                detail = (err or out or "").strip()[-300:] or f"rc={rc}"
+                self.logs.emit("colab", "error", f"[热切 EasyColab] 远端清场失败: {detail}")
+                return
+
+            with self._lock:
+                self._colab_state["gpu_name"] = ""
+                self._colab_state["mounts"] = {}
+                self._colab_state["vm_region"] = {}
+            self._set_deployment(
+                phase="idle",
+                step_index=0,
+                step_label="",
+                percent=0.0,
+                sub_percent=None,
+                detail="",
+                eta_text="",
+                error="",
+            )
+            self.config.set_selection(upstream_url="")
+            self.proxy.set_upstream("", engine_kind="maya", api_key="")
+            if self.on_telemetry_refresh is not None:
+                self.on_telemetry_refresh()
+
+            self.logs.emit(
+                "colab",
+                "success",
+                f"[热切 EasyColab] 远端清场完成（VM 已保留）: GPU={stats.get('gpu_name') or gpu_label}, "
+                f"VRAM 占用 {stats.get('vram_used_mb')}/{stats.get('vram_total_mb')} MiB, "
+                f"可用内存 {stats.get('ram_avail_gb')} GiB, 磁盘可用 {stats.get('disk_avail_gb')} GiB",
+            )
+
+            if not launch_easycolab:
+                return
+
+            ec = self.discover_easycolab_bundle()
+            if not ec.get("installed"):
+                self.logs.emit(
+                    "colab",
+                    "info",
+                    "[热切 EasyColab] 本机未检测到 EasyColab.app，但云端算力与空间已清场完毕，可直接从任意 EasyColab 端接管此实例。",
+                )
+                return
+
+            # Align EasyColab macOS wakeGPUChoiceV2 so clicking Wake won't accidentally discard the preserved GPU shape
+            if sys.platform == "darwin":
+                subprocess.run(
+                    ["defaults", "write", "app.easycolab.studio.macos", "wakeGPUChoiceV2", "-string", gpu_label],
+                    check=False,
+                )
+
+            if ec.get("app_py") and ec.get("runtime_auth_py"):
+                self.logs.emit("colab", "info", "[热切 EasyColab] 正在上传 EasyColab 多模型服务端并拉起通道...")
+                self._upload_file(sess, Path(ec["app_py"]), "/content/app.py")
+                self._upload_file(sess, Path(ec["runtime_auth_py"]), "/content/runtime_auth.py")
+
+                admin_pw = secrets.token_urlsafe(36)
+                launcher_src = (
+                    "import contextlib, os, re, shutil, signal, subprocess, sys, time, urllib.parse\n"
+                    "sys.path.insert(0, '/content')\n"
+                    "import app as ec_app\n"
+                    "from runtime_auth import authenticated_ingress, GRADIO_INGRESS, GRADIO_BACKEND\n"
+                    "from gradio import networking\n"
+                    "pw = os.environ.pop('EASYCOLAB_ADMIN_PASSWORD', '')\n"
+                    "ingress_ctx = authenticated_ingress(pw) if pw else contextlib.nullcontext()\n"
+                    "signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(SystemExit(0)))\n"
+                    "with ingress_ctx:\n"
+                    "    ui = ec_app.create_ui()\n"
+                    "    ui.queue()\n"
+                    "    fapp, _, _ = ui.launch(server_name='127.0.0.1', server_port=GRADIO_BACKEND, share=False, inline=False, prevent_thread_lock=True, css=ec_app.CUSTOM_CSS)\n"
+                    "    ec_app.attach_macos_api_routes(fapp)\n"
+                    "    share_url = ''\n"
+                    "    try:\n"
+                    "        tunnel = networking.setup_tunnel(local_host='127.0.0.1', local_port=GRADIO_INGRESS, share_token=ui.share_token, share_server_address=None, share_server_tls_certificate=None)\n"
+                    "        share_url = urllib.parse.urlsplit(tunnel)._replace(scheme='https').geturl()\n"
+                    "    except Exception as exc:\n"
+                    "        print(f'Gradio tunnel fallback to cloudflared ({exc})', flush=True)\n"
+                    "        cf_bin = shutil.which('cloudflared') or '/usr/local/bin/cloudflared'\n"
+                    "        if not os.path.isfile(cf_bin):\n"
+                    "            subprocess.run(['curl', '-fsSL', 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64', '-o', cf_bin], check=True)\n"
+                    "            os.chmod(cf_bin, 0o755)\n"
+                    "        cf_log = '/content/easycolab_cf.log'\n"
+                    "        if os.path.exists(cf_log): os.remove(cf_log)\n"
+                    "        subprocess.Popen([cf_bin, 'tunnel', '--no-autoupdate', '--url', f'http://127.0.0.1:{GRADIO_INGRESS}'], stdout=open(cf_log, 'w'), stderr=subprocess.STDOUT)\n"
+                    "        cf_re = re.compile(r'https://[a-zA-Z0-9-]+\\.trycloudflare\\.com')\n"
+                    "        for _ in range(45):\n"
+                    "            time.sleep(1)\n"
+                    "            if os.path.exists(cf_log):\n"
+                    "                m = cf_re.search(open(cf_log, errors='replace').read())\n"
+                    "                if m:\n"
+                    "                    share_url = m.group(0)\n"
+                    "                    break\n"
+                    "        if not share_url: raise RuntimeError('cloudflared tunnel failed')\n"
+                    "    print('EasyColab URL: ' + share_url, flush=True)\n"
+                    "    try: ui.block_thread()\n"
+                    "    finally: ui.close()\n"
+                )
+                remote_boot = (
+                    "import os, re, shutil, subprocess, sys, time\n"
+                    "from pathlib import Path\n"
+                    "if not shutil.which('nginx'):\n"
+                    "    subprocess.run(['apt-get', 'update', '-qq'], check=False)\n"
+                    "    subprocess.run(['apt-get', 'install', '-y', '-qq', 'nginx-light'], check=False)\n"
+                    "    subprocess.run(['service', 'nginx', 'stop'], check=False)\n"
+                    "if not os.path.exists('/content/DiffSynth-Studio'):\n"
+                    "    subprocess.run(['git', 'clone', '--depth', '1', 'https://github.com/modelscope/DiffSynth-Studio.git', '/content/DiffSynth-Studio'], check=True)\n"
+                    "    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '-U', 'transformers', 'accelerate', 'bitsandbytes', 'huggingface_hub', 'hf_transfer', 'qwen-vl-utils', 'einops', 'kernels>=0.17.2,<0.18.0', 'av', 'gradio', 'modelscope', 'imageio', 'imageio-ffmpeg', 'scipy', 'soundfile', 'librosa'], check=True)\n"
+                    "    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '--no-deps', 'fla-core', 'flash-linear-attention', 'causal-conv1d'], check=False)\n"
+                    "    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', '-e', '/content/DiffSynth-Studio'], check=True)\n"
+                    "for p in ('python.*/content/app.py', 'easycolab_launcher', 'cloudflared.*7860', 'nginx'):\n"
+                    "    subprocess.run(['pkill', '-9', '-f', p], check=False)\n"
+                    "time.sleep(1.0)\n"
+                    f"Path('/content/easycolab_launcher.py').write_text({launcher_src!r}, encoding='utf-8')\n"
+                    "if os.path.exists('/content/easycolab_server.log'): os.remove('/content/easycolab_server.log')\n"
+                    "env = dict(os.environ)\n"
+                    f"env['EASYCOLAB_ADMIN_PASSWORD'] = {admin_pw!r}\n"
+                    "env['EASYCOLAB_IDLE_TIMEOUT_MINUTES'] = '0'\n"
+                    "subprocess.Popen([sys.executable, '-u', '/content/easycolab_launcher.py'], cwd='/content', env=env, stdout=open('/content/easycolab_server.log', 'w'), stderr=subprocess.STDOUT, start_new_session=True)\n"
+                    "url_re = re.compile(r'^EasyColab URL: (https://\\S+)$', re.MULTILINE)\n"
+                    "found = ''\n"
+                    "for _ in range(75):\n"
+                    "    time.sleep(2)\n"
+                    "    if os.path.exists('/content/easycolab_server.log'):\n"
+                    "        m = url_re.search(open('/content/easycolab_server.log', errors='replace').read())\n"
+                    "        if m:\n"
+                    "            found = m.group(1)\n"
+                    "            break\n"
+                    "print('EASYCOLAB_URL_OUT:' + found)\n"
+                )
+                rc_b, out_b, err_b = self._run_bounded(
+                    [self.colab_bin, "exec", "-s", sess, "--timeout", "240"],
+                    stdin_data=remote_boot,
+                    timeout=260.0,
+                )
+                ec_url = ""
+                for ln in out_b.splitlines():
+                    if ln.startswith("EASYCOLAB_URL_OUT:"):
+                        ec_url = ln.split(":", 1)[1].strip().rstrip("/")
+                        break
+                if rc_b == 0 and ec_url:
+                    if sys.platform == "darwin":
+                        plist_domain = "app.easycolab.studio.macos"
+                        pw_map: dict[str, str] = {}
+                        try:
+                            raw_pl = subprocess.check_output(["defaults", "export", plist_domain, "-"], stderr=subprocess.DEVNULL)
+                            pl = plistlib.loads(raw_pl)
+                            if isinstance(pl.get("adminPasswordsByURL"), dict):
+                                pw_map = {str(k): str(v) for k, v in pl["adminPasswordsByURL"].items()}
+                        except Exception:
+                            pw_map = {}
+                        pw_map[ec_url] = admin_pw
+                        subprocess.run(["defaults", "write", plist_domain, "colabServerURL", "-string", ec_url], check=False)
+                        flat_kv = [x for k, v in pw_map.items() for x in (k, v)]
+                        subprocess.run(["defaults", "write", plist_domain, "adminPasswordsByURL", "-dict", *flat_kv], check=False)
+                        if ec.get("app_path"):
+                            subprocess.run(["open", "-a", ec["app_path"]], check=False)
+                    self.logs.emit(
+                        "colab",
+                        "success",
+                        f"已热切至 EasyColab：远端 MiniMax-H3 工作台已在 {gpu_label} 实例上线 ({mask_url(ec_url)})；请切换到 EasyColab 窗口使用（如窗口早先已打开，重开一次即可载入新连接）。",
+                    )
+                    return
+
+                self.logs.emit(
+                    "colab",
+                    "warn",
+                    f"[热切 EasyColab] 自动拉起隧道未返回新地址 ({(err_b or out_b).strip()[-200:]})，但云端已完成清场；正为你打开 EasyColab，请在窗口内选 {gpu_label} 点「唤醒并部署」。",
+                )
+
+            if sys.platform == "darwin" and ec.get("app_path"):
+                subprocess.run(["open", "-a", ec["app_path"]], check=False)
+                self.logs.emit("colab", "success", "已清场并拉起 EasyColab 客户端。")
+        except Exception as exc:
+            self.logs.emit("colab", "error", f"[热切 EasyColab] 异常: {exc}")
 
 
 def shlex_quote(s: str) -> str:

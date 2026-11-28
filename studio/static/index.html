@@ -189,8 +189,12 @@
             <div id="colabMountPills" class="mount-pills"></div>
           </div>
 
-          <!-- Danger Stop Button -->
+          <!-- Danger Stop & Handoff Actions -->
           <div class="card-footer-danger">
+            <button id="btnHandoffEasyColab" class="btn btn--handoff btn--block" type="button" title="保留当前 Colab GPU 实例不断机，清场 LLM 并切换至 EasyColab 跑 MiniMax-H3">
+              <span>🎬</span>
+              <span data-i18n="colab.handoffBtn">热切 EasyColab (MiniMax-H3)</span>
+            </button>
             <button id="btnStopColab" class="btn btn--danger-outline btn--block" type="button">
               <span>🛑</span>
               <span data-i18n="colab.stopBtn">释放云端实例</span>
@@ -663,10 +667,11 @@
               <button class="diag-chip" type="button" data-preset="tail_engine">远端引擎日志</button>
               <button class="diag-chip" type="button" data-preset="processes">进程与隧道</button>
               <button class="diag-chip" type="button" data-preset="colab_usage">Colab 额度</button>
+              <button class="diag-chip diag-chip--handoff" type="button" data-preset="handoff_easycolab" title="不断机保留当前 G4，一键清场 LLM 并切去 EasyColab">🎬 热切 EasyColab (H3)</button>
             </div>
             <form id="customCmdForm" class="cmd-input-row">
               <span class="cmd-prompt">$</span>
-              <input id="customCmdInput" class="cmd-input mono" type="text" placeholder="输入安全诊断命令并回车运行..." autocomplete="off" spellcheck="false">
+              <input id="customCmdInput" class="cmd-input mono" type="text" placeholder="输入安全诊断命令或 /handoff-easycolab 回车运行..." autocomplete="off" spellcheck="false">
               <button id="btnRunCustomCmd" class="btn btn--primary btn--xs" type="submit" data-i18n="logs.runCmd">运行</button>
             </form>
           </div>
@@ -732,6 +737,32 @@
       <div class="modal-footer">
         <button class="btn btn--ghost btn--sm" type="button" data-close-modal="stopConfirmModal" data-i18n="common.cancel">取消保留</button>
         <button id="btnConfirmStop" class="btn btn--danger btn--sm" type="button" data-i18n="modal.confirmStop">确认释放实例</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 2b. Handoff to EasyColab Confirm Modal -->
+  <div id="handoffConfirmModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="handoffModalTitle">
+    <div class="modal-card modal-card--sm">
+      <div class="modal-header">
+        <h3 id="handoffModalTitle" class="modal-title" data-i18n="modal.handoffTitle">热切至 EasyColab (MiniMax-H3)</h3>
+        <button class="modal-close" type="button" data-close-modal="handoffConfirmModal" aria-label="关闭">✕</button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-desc">
+          将在<strong>不断机、保留会话 <strong id="handoffSessionDisplay" class="mono">easycolab</strong> 当前云端 GPU</strong> 的前提下，停掉 Maya LLM 进程与 FUSE 挂载并拉起 EasyColab 多模态工作台（带 Cloudflare 隧道自动兜底）。
+        </p>
+        <label class="checkbox-inline" style="margin-top:8px;">
+          <input id="chkHandoffCleanModels" type="checkbox" checked>
+          <span data-i18n="modal.handoffCleanLabel">同时清理 /content/maya-models (~201 GB) 以腾足 MiniMax-H3 所需磁盘空间</span>
+        </label>
+        <div class="info-callout" style="margin-top:10px;" data-i18n="modal.handoffNote">
+          ✅ 不会销毁 Colab 虚拟机，无需重新排队；后续切换回 LLM 时可在 Studio 中直接重新部署复用此实例。
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn--ghost btn--sm" type="button" data-close-modal="handoffConfirmModal" data-i18n="common.cancel">取消</button>
+        <button id="btnConfirmHandoff" class="btn btn--primary btn--sm" type="button" data-i18n="modal.confirmHandoff">确认清场并切过去</button>
       </div>
     </div>
   </div>

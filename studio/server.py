@@ -783,6 +783,22 @@ class StudioServer:
                         self._send_json(200 if res.get("ok") else 400, res)
                         return
 
+                    if path == "/api/studio/colab/handoff-easycolab":
+                        if body.get("confirm") is not True:
+                            self._send_json(
+                                400,
+                                {"ok": False, "error": "Confirmation required: pass {\"confirm\": true}"},
+                            )
+                            return
+                        res = rt.colab.handoff_to_easycolab(
+                            session=str(body.get("session") or ""),
+                            confirm=True,
+                            clean_models=bool(body.get("clean_models", True)),
+                            launch_easycolab=bool(body.get("launch_easycolab", True)),
+                        )
+                        self._send_json(200 if res.get("ok") else 400, res)
+                        return
+
                     if path == "/api/studio/engine/configure":
                         st = rt.configure_engine(body)
                         self._send_json(200, {"ok": True, "state": st})

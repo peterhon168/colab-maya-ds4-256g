@@ -89,6 +89,7 @@
       "colab.balance": "账户余额 (CU)",
       "colab.burnRate": "扣费速率 (CU/h)",
       "colab.keepalive": "12m 保活",
+      "colab.handoffBtn": "热切 EasyColab (MiniMax-H3)",
       "colab.stopBtn": "释放云端实例",
       "engine.title": "推理引擎与加速模式",
       "engine.advancedOptions": "高级选项 (HF Repo / 上下文 / 双模阈值)",
@@ -162,6 +163,10 @@
       "modal.stopTitle": "确认释放云端 Colab 实例？",
       "modal.stopWarn": "⚠️ 此操作不可撤销：未持久化的内存状态和临时容器数据将会被回收。请确认后再继续。",
       "modal.confirmStop": "确认释放实例",
+      "modal.handoffTitle": "热切至 EasyColab (MiniMax-H3)",
+      "modal.handoffCleanLabel": "同时清理 /content/maya-models (~201 GB) 以腾足 MiniMax-H3 所需磁盘空间",
+      "modal.handoffNote": "✅ 不会销毁 Colab 虚拟机，无需重新排队；后续切换回 LLM 时可在 Studio 中直接重新部署复用此实例。",
+      "modal.confirmHandoff": "确认清场并切过去",
       "modal.credTitle": "外部安全凭据设置 (~/.config/maya-gcs/)",
       "modal.credSecurityNote": "所有凭据仅以目录 0700 / 文件 0600 权限存储在本地 ~/.config/maya-gcs/，绝不会提交至仓库或暴露明文回显。留空项将保持原有文件不变。",
       "modal.pickJsonFile": "导入本地 .json",
@@ -206,6 +211,7 @@
       "colab.balance": "Balance (CU)",
       "colab.burnRate": "Burn Rate (CU/h)",
       "colab.keepalive": "12m Keepalive",
+      "colab.handoffBtn": "Switch to EasyColab (H3)",
       "colab.stopBtn": "Release Cloud Instance",
       "engine.title": "Inference Engine & Mode",
       "engine.advancedOptions": "Advanced (HF Repo / Context / Thresholds)",
@@ -353,7 +359,7 @@
     }
     const cmdInput = $("customCmdInput");
     if (cmdInput) {
-      cmdInput.placeholder = ui.lang === "zh" ? "输入安全诊断命令并回车运行..." : "Run safe diagnostic command...";
+      cmdInput.placeholder = ui.lang === "zh" ? "输入安全诊断命令或 /handoff-easycolab 回车运行..." : "Run safe diagnostic command or /handoff-easycolab...";
     }
   }
 
@@ -1394,6 +1400,13 @@
       level: String(entry.level || "info").toLowerCase(),
       text: String(entry.text ?? entry.message ?? ""),
     });
+    const txt = String(entry.text ?? entry.message ?? "");
+    if (entry.id != null && txt.includes("已热切至 EasyColab")) {
+      playStudioSound("gpu_ready");
+      showToast(ui.lang === "zh" ? "🎬 已清场并热切至 EasyColab！" : "🎬 Switched to EasyColab!");
+    } else if (entry.id != null && txt.includes("[热切 EasyColab]") && String(entry.level).toLowerCase() === "error") {
+      playStudioSound("error");
+    }
     if (ui.logs.length > 1000) {
       ui.logs.splice(0, ui.logs.length - 1000);
     }
@@ -2031,7 +2044,41 @@
       }
     });
 
-    // Stop Colab (with secondary confirmation modal!)
+    // Stop Colab & Handoff to EasyColab (with secondary confirmation modals!)
+    const openHandoffModal = () => {
+      const display = $("handoffSessionDisplay");
+      if (display) display.textContent = getSessionValue();
+      openModal("handoffConfirmModal");
+    };
+
+    $("btnHandoffEasyColab")?.addEventListener("click", openHandoffModal);
+
+    $("btnConfirmHandoff")?.addEventListener("click", async () => {
+      const btn = $("btnConfirmHandoff");
+      ui.manualStoppingUntil = Date.now() + 180000;
+      setButtonBusy(btn, true, ui.lang === "zh" ? "热切清场中..." : "Switching...");
+      try {
+        await apiRequest("/api/studio/colab/handoff-easycolab", {
+          method: "POST",
+          body: {
+            session: getSessionValue(),
+            confirm: true,
+            clean_models: Boolean($("chkHandoffCleanModels")?.checked ?? true),
+            launch_easycolab: true,
+          },
+          timeoutMs: 30000,
+        });
+        closeModal("handoffConfirmModal");
+        await refreshStateNow();
+        showToast(ui.lang === "zh" ? "🎬 已发起热切 EasyColab 任务，请在右侧观察实时进度" : "🎬 EasyColab handoff started");
+      } catch (err) {
+        playStudioSound("error");
+        showToast(`${ui.lang === "zh" ? "热切失败" : "Handoff failed"}: ${err.message}`, "err");
+      } finally {
+        setButtonBusy(btn, false);
+      }
+    });
+
     $("btnStopColab")?.addEventListener("click", () => {
       const display = $("stopSessionDisplay");
       if (display) display.textContent = getSessionValue();
@@ -2535,7 +2582,14 @@
 
     document.querySelectorAll(".diag-chip").forEach((chip) => {
       chip.addEventListener("click", () => {
-        execCommand(chip.dataset.preset || "nvidia_smi", "", chip);
+        const preset = chip.dataset.preset || "nvidia_smi";
+        if (preset === "handoff_easycolab") {
+          const display = $("handoffSessionDisplay");
+          if (display) display.textContent = getSessionValue();
+          openModal("handoffConfirmModal");
+          return;
+        }
+        execCommand(preset, "", chip);
       });
     });
 
@@ -2545,6 +2599,12 @@
       const cmd = input?.value?.trim();
       if (!cmd) return;
       input.value = "";
+      if (cmd.toLowerCase() === "/handoff-easycolab" || cmd.toLowerCase() === "handoff-easycolab") {
+        const display = $("handoffSessionDisplay");
+        if (display) display.textContent = getSessionValue();
+        openModal("handoffConfirmModal");
+        return;
+      }
       await execCommand("custom", cmd, $("btnRunCustomCmd"));
     });
   }
