@@ -60,6 +60,8 @@
       "status.standby": "待机未连接",
       "top.guide": "示例接入指南",
       "top.openExternal": "外部浏览器打开 WebUI",
+      "top.soundAlert": "提示音",
+      "top.soundTest": "试听",
       "top.privacyMask": "录屏隐私打码",
       "common.refresh": "刷新",
       "common.recommended": "推荐",
@@ -175,6 +177,8 @@
       "status.standby": "Standby",
       "top.guide": "Quick Guide",
       "top.openExternal": "Open WebUI in Browser",
+      "top.soundAlert": "Alerts",
+      "top.soundTest": "Test",
       "top.privacyMask": "Privacy Mask",
       "common.refresh": "Refresh",
       "common.recommended": "Recommended",
@@ -294,6 +298,11 @@
   const ui = {
     lang: localStorage.getItem("maya_studio_lang") === "en" ? "en" : "zh",
     privacyMask: localStorage.getItem("maya_studio_privacy") !== "false",
+    soundEnabled: localStorage.getItem("maya_studio_sound") !== "false",
+    soundPreviewIdx: 0,
+    manualStoppingUntil: 0,
+    audioCtx: null,
+    soundLastPlayedAt: {},
     activeTab: "console",
     selectedGpu: "g4",
     selectedEnginePanel: "maya",
@@ -1065,6 +1074,10 @@
 
     // Hydrate user choices once on first poll
     if (!ui.hydratedFromServer) {
+      if (settings.sound_enabled !== undefined && localStorage.getItem("maya_studio_sound") === null) {
+        ui.soundEnabled = Boolean(settings.sound_enabled);
+        syncSoundButton();
+      }
       if (colab.selected_gpu) ui.selectedGpu = String(colab.selected_gpu).toLowerCase();
       if (engine.kind) ui.selectedEnginePanel = engine.kind === "strata" ? "strata" : "maya";
       if (engine.mode) ui.selectedMode = engine.mode;
@@ -1361,6 +1374,8 @@
     ) {
       renderLogs();
     }
+
+    maybeTriggerStateSounds(prevState, state);
   }
 
   function appendLogEntry(entry) {
@@ -1596,6 +1611,151 @@
     });
   }
 
+  function syncSoundButton() {
+    const btn = $("btnSoundToggle");
+    const icon = $("soundIcon");
+    const st = $("soundToggleState");
+    if (btn) {
+      btn.classList.toggle("is-active", ui.soundEnabled);
+      btn.setAttribute("aria-pressed", ui.soundEnabled ? "true" : "false");
+    }
+    if (icon) {
+      icon.textContent = ui.soundEnabled ? "🔔" : "🔕";
+    }
+    if (st) {
+      st.textContent = ui.soundEnabled ? "ON" : "OFF";
+    }
+  }
+
+  function ensureWebAudioContext() {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return null;
+    if (!ui.audioCtx) {
+      ui.audioCtx = new AudioCtx();
+    }
+    if (ui.audioCtx.state === "suspended") {
+      ui.audioCtx.resume().catch(() => {});
+    }
+    return ui.audioCtx;
+  }
+
+  function playWebAudioFallback(kind) {
+    const ctx = ensureWebAudioContext();
+    if (!ctx) return;
+    const patterns = {
+      gpu_ready: [
+        { freq: 523.25, delay: 0.0, dur: 0.14, gain: 0.14 },
+        { freq: 659.25, delay: 0.11, dur: 0.15, gain: 0.16 },
+        { freq: 783.99, delay: 0.22, dur: 0.34, gain: 0.18 },
+        { freq: 1046.5, delay: 0.24, dur: 0.32, gain: 0.08 },
+      ],
+      engine_online: [
+        { freq: 523.25, delay: 0.0, dur: 0.13, gain: 0.14 },
+        { freq: 659.25, delay: 0.10, dur: 0.13, gain: 0.15 },
+        { freq: 783.99, delay: 0.20, dur: 0.15, gain: 0.16 },
+        { freq: 1046.5, delay: 0.31, dur: 0.44, gain: 0.20 },
+      ],
+      error: [
+        { freq: 329.63, delay: 0.0, dur: 0.16, gain: 0.18, type: "triangle" },
+        { freq: 261.63, delay: 0.17, dur: 0.22, gain: 0.20, type: "triangle" },
+        { freq: 329.63, delay: 0.44, dur: 0.16, gain: 0.18, type: "triangle" },
+        { freq: 261.63, delay: 0.61, dur: 0.28, gain: 0.20, type: "triangle" },
+      ],
+      test: [
+        { freq: 659.25, delay: 0.0, dur: 0.12, gain: 0.14 },
+        { freq: 783.99, delay: 0.10, dur: 0.24, gain: 0.16 },
+      ],
+    };
+    const notes = patterns[kind] || patterns.test;
+    const base = ctx.currentTime + 0.01;
+    notes.forEach((n) => {
+      const osc = ctx.createOscillator();
+      const gainNode = ctx.createGain();
+      osc.type = n.type || "sine";
+      osc.frequency.setValueAtTime(n.freq, base + n.delay);
+      gainNode.gain.setValueAtTime(0.0001, base + n.delay);
+      gainNode.gain.linearRampToValueAtTime(n.gain, base + n.delay + 0.015);
+      gainNode.gain.exponentialRampToValueAtTime(0.0001, base + n.delay + n.dur);
+      osc.connect(gainNode);
+      gainNode.connect(ctx.destination);
+      osc.start(base + n.delay);
+      osc.stop(base + n.delay + n.dur + 0.02);
+    });
+  }
+
+  function playStudioSound(kind, { force = false } = {}) {
+    if (!force && !ui.soundEnabled) return false;
+    const norm = String(kind || "test").toLowerCase();
+    const now = Date.now();
+    if (!force && ui.soundLastPlayedAt[norm] && now - ui.soundLastPlayedAt[norm] < 1500) {
+      return false;
+    }
+    ui.soundLastPlayedAt[norm] = now;
+
+    const nativeBridge = window.webkit?.messageHandlers?.studioSound;
+    if (nativeBridge && typeof nativeBridge.postMessage === "function") {
+      try {
+        nativeBridge.postMessage({ kind: norm });
+        return true;
+      } catch {
+        // Fall through to Web Audio
+      }
+    }
+    playWebAudioFallback(norm);
+    return true;
+  }
+
+  function maybeTriggerStateSounds(prevState, nextState) {
+    if (!prevState || !nextState) return;
+    const prevDep = prevState.deployment || {};
+    const nextDep = nextState.deployment || {};
+    const prevEng = prevState.engine || {};
+    const nextEng = nextState.engine || {};
+    const prevColab = prevState.colab || {};
+    const nextColab = nextState.colab || {};
+
+    const prevPhase = String(prevDep.phase || "idle").toLowerCase();
+    const nextPhase = String(nextDep.phase || "idle").toLowerCase();
+    const prevStep = Number(prevDep.step_index || 0);
+    const nextStep = Number(nextDep.step_index || 0);
+    const prevErr = Boolean(prevDep.error) || prevPhase === "error";
+    const nextErr = Boolean(nextDep.error) || nextPhase === "error";
+
+    const prevOnline = Boolean(prevEng.online) && prevEng.loaded !== false;
+    const nextOnline = Boolean(nextEng.online) && nextEng.loaded !== false;
+
+    const prevAssign = Number(prevColab.active_assignments || 0);
+    const nextAssign = Number(nextColab.active_assignments || 0);
+    const prevLive = prevAssign > 0 || Boolean(prevColab.gpu_name) || prevOnline || Boolean(prevEng.upstream_url);
+    const nextDeploying = !nextOnline && nextPhase !== "idle" && nextPhase !== "ready" && nextPhase !== "error" && nextStep > 0;
+
+    // 1. 部署/排队失败
+    if (!prevErr && nextErr) {
+      playStudioSound("error");
+      return;
+    }
+
+    // 2. 运行中意外掉线或被 Colab 回收（排除用户手动释放窗口）
+    if (prevLive && nextAssign === 0 && !nextOnline && !nextDeploying && !nextEng.upstream_url && Date.now() >= ui.manualStoppingUntil) {
+      playStudioSound("error");
+      showToast(ui.lang === "zh" ? "⚠️ 检测到云端实例已断线或被回收" : "⚠️ Cloud instance disconnected or reclaimed", "err");
+      return;
+    }
+
+    // 3. 排队分配 GPU 成功（Step 1 provisioning -> 进入 Step 2+）
+    if ((prevPhase === "provisioning" || prevStep === 1) && !prevErr && !nextErr && nextStep >= 2) {
+      playStudioSound("gpu_ready");
+      showToast(ui.lang === "zh" ? "🎉 GPU 实例排队分配成功，已进入部署阶段" : "🎉 GPU allocated! Proceeding to deploy");
+      return;
+    }
+
+    // 4. 全部加载完毕，引擎正式就绪上线
+    if (!prevOnline && nextOnline) {
+      playStudioSound("engine_online");
+      showToast(ui.lang === "zh" ? "🚀 云端推理引擎已就绪上线" : "🚀 Inference engine is online and ready");
+    }
+  }
+
   function syncPrivacyButton() {
     const btn = $("btnPrivacyMask");
     const st = $("privacyMaskState");
@@ -1651,6 +1811,37 @@
       renderMayaModes();
       if (ui.lastState) renderState(ui.lastState);
       renderLogs();
+    });
+
+    $("btnSoundToggle")?.addEventListener("click", () => {
+      ui.soundEnabled = !ui.soundEnabled;
+      localStorage.setItem("maya_studio_sound", String(ui.soundEnabled));
+      syncSoundButton();
+      apiRequest("/api/studio/settings", {
+        method: "POST",
+        body: { sound_enabled: ui.soundEnabled },
+      }).catch(() => {});
+      if (ui.soundEnabled) {
+        playStudioSound("test", { force: true });
+      }
+      showToast(
+        ui.soundEnabled
+          ? (ui.lang === "zh" ? "已开启提示音（排队成功与异常都会自动播报）" : "Audio alerts enabled")
+          : (ui.lang === "zh" ? "已静音状态提示音" : "Audio alerts muted"),
+        "ok"
+      );
+    });
+
+    $("btnSoundPreview")?.addEventListener("click", () => {
+      const sequence = [
+        { kind: "gpu_ready", zh: "🎵 试听：排队 / GPU 分配成功庆祝音", en: "🎵 Preview: GPU allocation success chime" },
+        { kind: "engine_online", zh: "🎵 试听：748B 上线就绪凯旋音", en: "🎵 Preview: Engine online fanfare" },
+        { kind: "error", zh: "🎵 试听：失败 / 掉线告警提示音", en: "🎵 Preview: Failure / disconnect alert" },
+      ];
+      const item = sequence[ui.soundPreviewIdx % sequence.length];
+      ui.soundPreviewIdx += 1;
+      playStudioSound(item.kind, { force: true });
+      showToast(ui.lang === "zh" ? item.zh : item.en, item.kind === "error" ? "warn" : "ok");
     });
 
     $("btnPrivacyMask")?.addEventListener("click", () => {
@@ -1735,6 +1926,7 @@
         showToast(ui.lang === "zh" ? "已启动云端实例部署流水线" : "Deployment pipeline started");
         await refreshStateNow();
       } catch (err) {
+        playStudioSound("error");
         showToast(`${ui.lang === "zh" ? "部署失败" : "Deploy failed"}: ${err.message}`, "err");
       } finally {
         setButtonBusy(btn, false);
@@ -1808,6 +2000,7 @@
 
     $("btnConfirmStop")?.addEventListener("click", async () => {
       const btn = $("btnConfirmStop");
+      ui.manualStoppingUntil = Date.now() + 15000;
       setButtonBusy(btn, true, ui.lang === "zh" ? "释放中..." : "Releasing...");
       try {
         await apiRequest("/api/studio/colab/stop", {
@@ -2323,7 +2516,15 @@
     }
 
     syncPrivacyButton();
+    syncSoundButton();
     applyI18n();
+    const unlockAudioOnce = () => {
+      ensureWebAudioContext();
+      document.removeEventListener("pointerdown", unlockAudioOnce);
+      document.removeEventListener("keydown", unlockAudioOnce);
+    };
+    document.addEventListener("pointerdown", unlockAudioOnce, { once: true });
+    document.addEventListener("keydown", unlockAudioOnce, { once: true });
     renderGpuSelection();
     renderEngineSegment();
     renderMayaModes();

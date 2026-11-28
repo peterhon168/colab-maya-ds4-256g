@@ -347,6 +347,81 @@ body.shell-macos .topbar {
   color: #6EE7B7;
 }
 
+.sound-pill-group {
+  display: inline-flex;
+  align-items: center;
+  height: 28px;
+  border-radius: 7px;
+  border: 1px solid var(--border-subtle);
+  background: rgba(17, 24, 38, 0.85);
+  overflow: hidden;
+}
+
+.sound-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 100%;
+  padding: 0 9px;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s ease;
+}
+
+.sound-toggle:hover {
+  color: var(--text-primary);
+  background: rgba(148, 163, 184, 0.08);
+}
+
+.sound-toggle.is-active {
+  background: rgba(59, 130, 246, 0.16);
+  color: #BFDBFE;
+}
+
+.sound-state {
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  background: rgba(15, 23, 42, 0.65);
+  color: var(--text-secondary);
+}
+
+.sound-toggle.is-active .sound-state {
+  background: rgba(59, 130, 246, 0.28);
+  color: #93C5FD;
+}
+
+.sound-preview-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 100%;
+  padding: 0 8px;
+  border: none;
+  border-left: 1px solid var(--border-subtle);
+  background: rgba(15, 23, 42, 0.35);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s ease;
+}
+
+.sound-preview-btn:hover {
+  color: var(--text-primary);
+  background: rgba(59, 130, 246, 0.22);
+}
+
 /* 3-Column Grid */
 .workspace-grid {
   flex: 1;

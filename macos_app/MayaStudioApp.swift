@@ -191,10 +191,148 @@ private final class TitlebarDragView: NSView {
     override var mouseDownCanMoveWindow: Bool { true }
 }
 
+// MARK: - Native Background Sound Alert Synthesizer (Works even when app is hidden/minimized)
+
+@MainActor
+private final class StudioSoundPlayer: NSObject, NSSoundDelegate {
+    private struct Note {
+        let freq: Double
+        let start: Double
+        let duration: Double
+        let gain: Double
+        let harmonic: Double
+    }
+
+    private var activeSounds: [NSSound] = []
+    private var lastPlayedAt: [String: Date] = [:]
+    private var cachedWavs: [String: Data] = [:]
+
+    func play(kind: String) {
+        let normalized = kind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let now = Date()
+        if normalized != "test", let prev = lastPlayedAt[normalized], now.timeIntervalSince(prev) < 1.5 {
+            return
+        }
+        lastPlayedAt[normalized] = now
+
+        let wavData = cachedWavs[normalized] ?? buildWav(for: normalized)
+        cachedWavs[normalized] = wavData
+        guard let sound = NSSound(data: wavData) else {
+            NSSound.beep()
+            return
+        }
+        sound.volume = 0.85
+        sound.delegate = self
+        activeSounds.append(sound)
+        sound.play()
+    }
+
+    nonisolated func sound(_ sound: NSSound, didFinishPlaying flag: Bool) {
+        Task { @MainActor [weak self] in
+            self?.activeSounds.removeAll { $0 === sound }
+        }
+    }
+
+    private func buildWav(for kind: String) -> Data {
+        let notes: [Note]
+        switch kind {
+        case "gpu_ready":
+            // Bright celebratory triad arpeggio: C5 -> E5 -> G5 (with gentle shimmer)
+            notes = [
+                Note(freq: 523.25, start: 0.00, duration: 0.14, gain: 0.28, harmonic: 0.22),
+                Note(freq: 659.25, start: 0.11, duration: 0.15, gain: 0.30, harmonic: 0.24),
+                Note(freq: 783.99, start: 0.22, duration: 0.34, gain: 0.34, harmonic: 0.26),
+                Note(freq: 1046.50, start: 0.24, duration: 0.32, gain: 0.14, harmonic: 0.10),
+            ]
+        case "engine_online":
+            // Full celebratory fanfare: C5 -> E5 -> G5 -> C6
+            notes = [
+                Note(freq: 523.25, start: 0.00, duration: 0.13, gain: 0.26, harmonic: 0.20),
+                Note(freq: 659.25, start: 0.10, duration: 0.13, gain: 0.28, harmonic: 0.22),
+                Note(freq: 783.99, start: 0.20, duration: 0.15, gain: 0.30, harmonic: 0.24),
+                Note(freq: 1046.50, start: 0.31, duration: 0.44, gain: 0.35, harmonic: 0.26),
+                Note(freq: 523.25, start: 0.31, duration: 0.42, gain: 0.14, harmonic: 0.10),
+            ]
+        case "error":
+            // Clear, noticeable two-pulse alert: E4 -> C4 repeated once
+            notes = [
+                Note(freq: 329.63, start: 0.00, duration: 0.16, gain: 0.34, harmonic: 0.28),
+                Note(freq: 261.63, start: 0.17, duration: 0.22, gain: 0.36, harmonic: 0.30),
+                Note(freq: 329.63, start: 0.44, duration: 0.16, gain: 0.34, harmonic: 0.28),
+                Note(freq: 261.63, start: 0.61, duration: 0.28, gain: 0.38, harmonic: 0.32),
+            ]
+        default:
+            // Soft test/confirmation chime: E5 -> G5
+            notes = [
+                Note(freq: 659.25, start: 0.00, duration: 0.12, gain: 0.25, harmonic: 0.20),
+                Note(freq: 783.99, start: 0.10, duration: 0.24, gain: 0.28, harmonic: 0.22),
+            ]
+        }
+        return synthesizeWav(notes: notes, sampleRate: 44100)
+    }
+
+    private func synthesizeWav(notes: [Note], sampleRate: Int) -> Data {
+        let totalSec = (notes.map { $0.start + $0.duration }.max() ?? 0.3) + 0.04
+        let sampleCount = max(1, Int(totalSec * Double(sampleRate)))
+        var mix = [Double](repeating: 0.0, count: sampleCount)
+        let twoPi = 2.0 * Double.pi
+
+        for note in notes {
+            let startIdx = max(0, Int(note.start * Double(sampleRate)))
+            let len = max(1, Int(note.duration * Double(sampleRate)))
+            let endIdx = min(sampleCount, startIdx + len)
+            let attackSamples = max(1.0, 0.012 * Double(sampleRate))
+
+            for idx in startIdx..<endIdx {
+                let local = Double(idx - startIdx)
+                let t = local / Double(sampleRate)
+                let envAttack = min(1.0, local / attackSamples)
+                let progress = local / Double(len)
+                let envDecay = pow(max(0.0, 1.0 - progress), 1.45)
+                let env = envAttack * envDecay
+                let fundamental = sin(twoPi * note.freq * t)
+                let overtone = note.harmonic * sin(twoPi * (note.freq * 2.0) * t)
+                mix[idx] += note.gain * env * (fundamental + overtone)
+            }
+        }
+
+        let dataByteCount = sampleCount * 2
+        var wav = Data(capacity: 44 + dataByteCount)
+
+        func appendASCII(_ s: String) {
+            wav.append(contentsOf: s.utf8)
+        }
+        func appendLE<T: FixedWidthInteger>(_ val: T) {
+            var le = val.littleEndian
+            withUnsafeBytes(of: &le) { wav.append(contentsOf: $0) }
+        }
+
+        appendASCII("RIFF")
+        appendLE(UInt32(36 + dataByteCount))
+        appendASCII("WAVE")
+        appendASCII("fmt ")
+        appendLE(UInt32(16))         // PCM chunk size
+        appendLE(UInt16(1))          // AudioFormat = PCM
+        appendLE(UInt16(1))          // NumChannels = Mono
+        appendLE(UInt32(sampleRate)) // SampleRate
+        appendLE(UInt32(sampleRate * 2))
+        appendLE(UInt16(2))          // BlockAlign
+        appendLE(UInt16(16))         // BitsPerSample
+        appendASCII("data")
+        appendLE(UInt32(dataByteCount))
+
+        for sample in mix {
+            let clamped = max(-0.95, min(0.95, sample))
+            appendLE(Int16(clamped * 32767.0))
+        }
+        return wav
+    }
+}
+
 // MARK: - Main Studio Window Controller
 
 @MainActor
-final class StudioWindowController: NSWindowController, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate {
+final class StudioWindowController: NSWindowController, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, WKScriptMessageHandler {
     private static let bgColor = NSColor(srgbRed: 0x0B / 255.0, green: 0x0F / 255.0, blue: 0x17 / 255.0, alpha: 1.0)
     private static let cardColor = NSColor(srgbRed: 0x11 / 255.0, green: 0x18 / 255.0, blue: 0x26 / 255.0, alpha: 1.0)
     private static let accentColor = NSColor(srgbRed: 0x25 / 255.0, green: 0x63 / 255.0, blue: 0xEB / 255.0, alpha: 1.0)
@@ -219,6 +357,8 @@ final class StudioWindowController: NSWindowController, WKNavigationDelegate, WK
     private var outputBuffer = ""
     private var startupAttemptId = 0
     private var activeDownloads: [ObjectIdentifier: URL] = [:]
+    private let soundPlayer = StudioSoundPlayer()
+    private var backgroundActivity: NSObjectProtocol?
 
     private var studioURL: URL {
         URL(string: "http://\(studioHost):\(studioPort)/?shell=macos")!
@@ -267,6 +407,7 @@ final class StudioWindowController: NSWindowController, WKNavigationDelegate, WK
         config.preferences.javaScriptCanOpenWindowsAutomatically = true
         config.preferences.setValue(true, forKey: "developerExtrasEnabled")
         config.websiteDataStore = .default()
+        config.userContentController.add(self, name: "studioSound")
 
         let wv = WKWebView(frame: contentView.bounds, configuration: config)
         wv.translatesAutoresizingMaskIntoConstraints = false
@@ -421,6 +562,12 @@ final class StudioWindowController: NSWindowController, WKNavigationDelegate, WK
     // MARK: - Startup & Backend Lifecycle
 
     func start() {
+        if backgroundActivity == nil {
+            backgroundActivity = ProcessInfo.processInfo.beginActivity(
+                options: [.userInitiatedAllowingIdleSystemSleep],
+                reason: "Keep Maya Strata Studio polling and audio alerts active in background"
+            )
+        }
         startupAttemptId += 1
         let attempt = startupAttemptId
         showLoadingState(
@@ -598,6 +745,10 @@ final class StudioWindowController: NSWindowController, WKNavigationDelegate, WK
     }
 
     func terminateOwnedBackendIfNeeded() {
+        if let act = backgroundActivity {
+            ProcessInfo.processInfo.endActivity(act)
+            backgroundActivity = nil
+        }
         // Strictly terminate ONLY the backend process spawned by this .app instance.
         // Never touch external studio servers, keepalive_colab.sh, or remote Colab VMs.
         guard let proc = spawnedBackendProcess else { return }
@@ -801,6 +952,17 @@ final class StudioWindowController: NSWindowController, WKNavigationDelegate, WK
 
     func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
         download.delegate = self
+    }
+
+    // MARK: - WKScriptMessageHandler (Native Background Audio Alerts)
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.name == "studioSound" else { return }
+        if let dict = message.body as? [String: Any], let kind = dict["kind"] as? String {
+            soundPlayer.play(kind: kind)
+        } else if let kind = message.body as? String {
+            soundPlayer.play(kind: kind)
+        }
     }
 
     // MARK: - WKDownloadDelegate

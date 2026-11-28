@@ -154,6 +154,7 @@ MODES_BY_ID: dict[str, dict[str, Any]] = {m["id"]: m for m in MODES_CATALOG}
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "mask_urls": True,
+    "sound_enabled": True,
     "hf_repo": DEFAULT_HF_REPO,
     "s2_gcs_thresh": 160,
     "s2_local_max": 16,
@@ -387,6 +388,8 @@ class ConfigStore:
         with self._lock:
             if "mask_urls" in patch:
                 self.settings["mask_urls"] = bool(patch["mask_urls"])
+            if "sound_enabled" in patch:
+                self.settings["sound_enabled"] = bool(patch["sound_enabled"])
             if "hf_repo" in patch and isinstance(patch["hf_repo"], str):
                 val = patch["hf_repo"].strip()
                 if val:
