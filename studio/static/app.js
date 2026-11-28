@@ -303,6 +303,9 @@
     manualStoppingUntil: 0,
     audioCtx: null,
     soundLastPlayedAt: {},
+    announcedGpuKey: "",
+    announcedOnlineKey: "",
+    announcedErrorKey: "",
     activeTab: "console",
     selectedGpu: "g4",
     selectedEnginePanel: "maya",
@@ -1706,32 +1709,63 @@
   }
 
   function maybeTriggerStateSounds(prevState, nextState) {
-    if (!prevState || !nextState) return;
-    const prevDep = prevState.deployment || {};
+    if (!nextState) return;
     const nextDep = nextState.deployment || {};
-    const prevEng = prevState.engine || {};
     const nextEng = nextState.engine || {};
-    const prevColab = prevState.colab || {};
     const nextColab = nextState.colab || {};
 
-    const prevPhase = String(prevDep.phase || "idle").toLowerCase();
     const nextPhase = String(nextDep.phase || "idle").toLowerCase();
-    const prevStep = Number(prevDep.step_index || 0);
     const nextStep = Number(nextDep.step_index || 0);
-    const prevErr = Boolean(prevDep.error) || prevPhase === "error";
     const nextErr = Boolean(nextDep.error) || nextPhase === "error";
-
-    const prevOnline = Boolean(prevEng.online) && prevEng.loaded !== false;
     const nextOnline = Boolean(nextEng.online) && nextEng.loaded !== false;
-
-    const prevAssign = Number(prevColab.active_assignments || 0);
     const nextAssign = Number(nextColab.active_assignments || 0);
-    const prevLive = prevAssign > 0 || Boolean(prevColab.gpu_name) || prevOnline || Boolean(prevEng.upstream_url);
     const nextDeploying = !nextOnline && nextPhase !== "idle" && nextPhase !== "ready" && nextPhase !== "error" && nextStep > 0;
 
-    // 1. 部署/排队失败
+    const deploySessionKey = String(
+      nextDep.started_at || nextEng.upstream_url || nextColab.selected_session || "default"
+    );
+    const onlineKey = String(
+      nextEng.upstream_url || nextDep.started_at || nextColab.selected_session || "local"
+    );
+    const errorKey = `${deploySessionKey}:${String(nextDep.error || nextPhase)}`;
+
+    // 首次加载建立基线：如果打开页面时已在线/已排队过，记录去重 Key，避免后续闪断恢复误响
+    if (!prevState) {
+      if (nextStep >= 2 && !nextErr) {
+        ui.announcedGpuKey = deploySessionKey;
+      }
+      if (nextOnline) {
+        ui.announcedOnlineKey = onlineKey;
+      }
+      if (nextErr) {
+        ui.announcedErrorKey = errorKey;
+      }
+      return;
+    }
+
+    const prevDep = prevState.deployment || {};
+    const prevEng = prevState.engine || {};
+    const prevColab = prevState.colab || {};
+
+    const prevPhase = String(prevDep.phase || "idle").toLowerCase();
+    const prevStep = Number(prevDep.step_index || 0);
+    const prevErr = Boolean(prevDep.error) || prevPhase === "error";
+    const prevOnline = Boolean(prevEng.online) && prevEng.loaded !== false;
+    const prevAssign = Number(prevColab.active_assignments || 0);
+    const prevLive = prevAssign > 0 || Boolean(prevColab.gpu_name) || prevOnline || Boolean(prevEng.upstream_url);
+
+    // 回到完全空闲待机时重置去重 Key，允许下一次新开/新接入实例播报
+    if (!nextOnline && !nextDeploying && !nextErr && nextAssign === 0 && !nextEng.upstream_url) {
+      ui.announcedGpuKey = "";
+      ui.announcedOnlineKey = "";
+    }
+
+    // 1. 部署/排队失败（同一错只报一次）
     if (!prevErr && nextErr) {
-      playStudioSound("error");
+      if (ui.announcedErrorKey !== errorKey) {
+        ui.announcedErrorKey = errorKey;
+        playStudioSound("error");
+      }
       return;
     }
 
@@ -1742,17 +1776,23 @@
       return;
     }
 
-    // 3. 排队分配 GPU 成功（Step 1 provisioning -> 进入 Step 2+）
+    // 3. 排队分配 GPU 成功（Step 1 provisioning -> 进入 Step 2+，同一轮部署只响一次）
     if ((prevPhase === "provisioning" || prevStep === 1) && !prevErr && !nextErr && nextStep >= 2) {
-      playStudioSound("gpu_ready");
-      showToast(ui.lang === "zh" ? "🎉 GPU 实例排队分配成功，已进入部署阶段" : "🎉 GPU allocated! Proceeding to deploy");
+      if (ui.announcedGpuKey !== deploySessionKey) {
+        ui.announcedGpuKey = deploySessionKey;
+        playStudioSound("gpu_ready");
+        showToast(ui.lang === "zh" ? "🎉 GPU 实例排队分配成功，已进入部署阶段" : "🎉 GPU allocated! Proceeding to deploy");
+      }
       return;
     }
 
-    // 4. 全部加载完毕，引擎正式就绪上线
+    // 4. 全部加载完毕，引擎正式就绪上线（同一个 upstream/实例生命周期只响一次，防止推理忙时遥测闪断重复庆祝）
     if (!prevOnline && nextOnline) {
-      playStudioSound("engine_online");
-      showToast(ui.lang === "zh" ? "🚀 云端推理引擎已就绪上线" : "🚀 Inference engine is online and ready");
+      if (ui.announcedOnlineKey !== onlineKey) {
+        ui.announcedOnlineKey = onlineKey;
+        playStudioSound("engine_online");
+        showToast(ui.lang === "zh" ? "🚀 云端推理引擎已就绪上线" : "🚀 Inference engine is online and ready");
+      }
     }
   }
 

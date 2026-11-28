@@ -971,6 +971,12 @@ def fetch_engine_telemetry(
             loaded = bool(status_data["loaded"])
         else:
             loaded = s_status in ("ok", "ready", "healthy", "loaded", "idle", "busy", "generating")
+    elif metrics_json is not None:
+        # /health 偶发超时但 /metrics 正常返回活跃引擎信息时，若处于已运行推理状态则仍视作已加载
+        eng_block = metrics_json.get("engine") if isinstance(metrics_json.get("engine"), dict) else {}
+        live_block = metrics_json.get("live") if isinstance(metrics_json.get("live"), dict) else {}
+        lstate = str(live_block.get("state") or "").lower()
+        loaded = bool(eng_block.get("model")) or lstate in ("idle", "reading", "generating", "writing", "busy")
     else:
         loaded = models_data is not None
 
